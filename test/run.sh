@@ -87,6 +87,9 @@ local = read("Fixture.quad'")
 check('local notation "⦃" n "⦄" => double (double n)' in local,
       "quad': the local notation it uses is not replayed")
 
+check("variable (g : (Nat → Nat))" in read("Fixture.Pair.app_eq"),
+      "Pair.app_eq: a binder holding parentheses is dropped")
+
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
 print("ok: proofs, values, annotations, notation, sections, binders and closures")

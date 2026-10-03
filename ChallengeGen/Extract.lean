@@ -388,14 +388,20 @@ def derivingReplacement? (source : String) (stx : Syntax) (cmdEnd : String.Pos.R
   let instances := classes.map fun c => s!"instance{bindersClause} : {c} ({app}) := sorry"
   return some (dpos, instances.toArray)
 
-/-- Every identifier appearing anywhere in `stx`, as strings. -/
+/-- Every identifier appearing anywhere in `stx`, as strings.
+
+Identifiers with an anonymous name are not counted: every parenthesis carries one, in the
+`hygieneInfo` node of its `hygienicLParen`. Counted, it would resolve against every namespace in
+scope to the namespace itself, and so name the declaration of that name (a structure whose namespace
+the file is in), dropping every `variable` binder with a parenthesis in it whenever that declaration
+is left out. -/
 partial def collectIdents (stx : Syntax) : Array String := Id.run do
   let mut acc : Array String := #[]
   let mut worklist : Array Syntax := #[stx]
   while !worklist.isEmpty do
     let s := worklist.back!
     worklist := worklist.pop
-    if s.isIdent then acc := acc.push s.getId.toString
+    if s.isIdent && !s.getId.isAnonymous then acc := acc.push s.getId.toString
     for a in s.getArgs do
       worklist := worklist.push a
   return acc

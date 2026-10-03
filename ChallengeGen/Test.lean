@@ -323,6 +323,13 @@ are the ones whose loss makes *other* declarations fail to elaborate. -/
 #guard (collectSyntaxKinds (.node .none `A.b #[.node .none `C.d #[]])).contains `C.d
 #guard !(collectSyntaxKinds (.node .none `A.b #[])).contains `X.y
 
+/-! ## `collectIdents` -/
+
+-- A parenthesis carries an identifier with an anonymous name (`hygieneInfo`); it is not one.
+#guard collectIdents (.node .none `Lean.Parser.Term.paren #[
+    .node .none `hygieneInfo #[.ident .none default .anonymous []],
+    .ident .none default `x []]) == #["x"]
+
 /-! ## Names of the files written
 
 `anchorIdOf` is the stem of the file written for a declaration, so it is a contract with whoever
