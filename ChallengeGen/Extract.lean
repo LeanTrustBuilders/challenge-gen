@@ -709,12 +709,12 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       if pos ≥ cmdStart.byteIdx && pos < cmdEnd.byteIdx then
         names := names ++ declared
     if !names.isEmpty then
-      -- A proof: a theorem or lemma, or a command all of whose declarations are theorems, such as an
-      -- `instance` of a `Prop`-valued class. Its value is replaced by `sorry` whole; Lean decides
-      -- which section variables a theorem takes from its statement alone, so this cannot change
-      -- its signature, and no tactic of it has to run in the extracted file.
-      let isProof := isTheoremDecl stx ||
-        names.all fun n => (env.find? n).any (· matches .thmInfo _)
+      -- A theorem or lemma, whose value is replaced by `sorry` whole: Lean decides which section
+      -- variables it takes from its statement alone, so this cannot change its signature. Not an
+      -- `instance` of a `Prop`-valued class, although it is a theorem too: an instance takes the
+      -- variables its value uses, like a definition, and with its value replaced it would lose
+      -- those only its proof uses (`[BorelSpace E]` in an `IsGaussian` instance did).
+      let isProof := isTheoremDecl stx
       -- Proofs: replace the whole value with `sorry`. Definitions: keep the value verbatim but
       -- replace any embedded `by …` tactic proofs in it with `sorry`, and turn a `deriving` clause
       -- into standalone `instance … := sorry` (it can't be delta-derived in the minimal file).

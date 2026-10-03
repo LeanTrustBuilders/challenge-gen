@@ -1,7 +1,7 @@
 import Fixture.Basic
 
-/-! `open NS (a)` naming a declaration from outside the project, and an instance of a `Prop`-valued
-class whose proof is a tactic block naming a lemma it does not use. -/
+/-! `open NS (a)` naming a declaration from outside the project, instances of a `Prop`-valued
+class, and names Lean generates for instances. -/
 
 open Nat (succ)
 
@@ -9,14 +9,20 @@ namespace Fixture
 
 def three : Nat := succ 2
 
-/-- Never used by a proof below, though a tactic names it. -/
-theorem unused_lemma : 2 + 2 = 4 := rfl
-
 class IsPositive (n : Nat) : Prop where
   pos : 0 < n
 
 instance : IsPositive three where
-  pos := by simp [unused_lemma, three]
+  pos := by simp [three]
+
+section
+variable {m : Nat} [IsPositive m]
+
+/-- Its proof uses `[IsPositive m]`, which its statement does not mention: an instance takes the
+variables its value uses, so its value cannot become `sorry` without changing its signature. -/
+instance : IsPositive (m * 1) := by simpa using (inferInstance : IsPositive m)
+
+end
 
 /-- Derived in the namespace of the definition, `Fixture.Wrap`, not the current one. -/
 def Wrap.Num := Nat

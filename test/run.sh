@@ -104,8 +104,8 @@ check("include b" not in read("Fixture.Inc.early") and "Big" not in read("Fixtur
       "early: an include naming a binder left out is kept")
 
 check("open Nat (succ)" in read("Fixture.three"), "three: an open of a name from outside the project is dropped")
-check("instance instIsPositiveThree : IsPositive three := sorry" in read("Fixture.instIsPositiveThree"),
-      "instIsPositiveThree: an instance of a Prop-valued class keeps its proof")
+check("pos := by simp [three]" in read("Fixture.instIsPositiveThree"),
+      "instIsPositiveThree: an instance's value, which decides the variables it takes, is replaced")
 
 check("def earlyId (ℵ : Nat) : Nat := ℵ" in (out / "earlyId.lean").read_text(),
       "earlyId: a module parsed with syntax it does not import is cut")
