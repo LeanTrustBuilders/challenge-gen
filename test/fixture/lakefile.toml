@@ -7,5 +7,12 @@ name = "TrustAnnotations"
 git = "https://github.com/LeanTrustBuilders/annotations"
 rev = "main"
 
+# Two options a challenge file must be compiled with, and two that change only what Lean reports.
+[leanOptions]
+autoImplicit = false
+maxSynthPendingDepth = 3
+pp.unicode.fun = true
+linter.unusedVariables = false
+
 [[lean_lib]]
 name = "Fixture"

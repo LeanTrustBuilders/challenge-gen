@@ -1043,11 +1043,13 @@ def stripEmptyScopes (items : Array OutChunk) : Array OutChunk := Id.run do
   return top
 
 /-- Drops every `set_option` line that re-sets an option to the value already in effect where it
-stands. The option state is tracked as a stack that pops with each `end`, mirroring how Lean scopes
-the setting: a value restored by leaving a scope is *not* still in effect afterwards. -/
-def dropReSetOptions (chunks : Array OutChunk) : Array OutChunk := Id.run do
+stands, `inEffect` being what is in effect before the first chunk. The option state is tracked as a
+stack that pops with each `end`, mirroring how Lean scopes the setting: a value restored by leaving a
+scope is *not* still in effect afterwards. -/
+def dropReSetOptions (chunks : Array OutChunk) (inEffect : Std.HashMap Name String := {}) :
+    Array OutChunk := Id.run do
   let mut out : Array OutChunk := #[]
-  let mut scopes : Array (Std.HashMap Name String) := #[{}]
+  let mut scopes : Array (Std.HashMap Name String) := #[inEffect]
   for c in chunks do
     match c.tag, c.setOption? with
     | .openSection, _ | .openNamespace, _ =>
@@ -1085,8 +1087,62 @@ Worth doing because these come in runs. A source file that sets `autoImplicit fa
 budget above each of its sections contributes one such pair per section, and once the sections
 themselves are gone (`stripEmptyScopes`) what is left is a block of consecutive settings with nothing
 between them for any of them but the last to apply to. -/
-def dropRedundantOptions (chunks : Array OutChunk) : Array OutChunk :=
-  dropSupersededOptions (dropReSetOptions chunks)
+def dropRedundantOptions (chunks : Array OutChunk) (inEffect : Std.HashMap Name String := {}) :
+    Array OutChunk :=
+  dropSupersededOptions (dropReSetOptions chunks inEffect)
+
+/-! ## The project's options
+
+The options a project is built with — its lakefile's `leanOptions`, `autoImplicit false` above all —
+are in no source file, so a file made of the source compiles under Lean's defaults unless they are
+set again. Under `autoImplicit`, a binder lost from a `variable` command does not fail: its name is
+bound anew, with a more general type, and the file states another theorem.
+
+Lake records them per module, in the `.setup.json` it compiles the module with. They are set again
+at the top of a file when every module in it shares them, and at the top of a module's block where
+it differs. -/
+
+/-- Options that change only what Lean reports, never what a file means or whether it compiles: not
+set again. `warningAsError` among them, since every `sorry` warns. -/
+def reportOnlyOptions : Array Name :=
+  #[`pp, `format, `linter, `trace, `profiler, `diagnostics, `debug, `warn, `warning, `eval,
+    `warningAsError, `maxErrors, `printMessageEndPos, `showPartialSyntaxErrors, `showTacticDiff,
+    `showInferredTerminationBy, `stderrAsMessages, `maxTraceChildren]
+
+/-- Whether an option the project is built with is set again: one of Lean's own (`builtin`, the
+options registered before any module is imported), since only those are known in every file, and
+not one of the `reportOnlyOptions`. -/
+def isReplayedOption (builtin : Std.HashSet Name) (o : Name) : Bool :=
+  builtin.contains o && !reportOnlyOptions.any (hasPrefixName o ·)
+
+/-- An option's value as a `.setup.json` gives it, written as `set_option` takes it. -/
+def renderOptionValue : Json → Option String
+  | .bool b => some (toString b)
+  | .num n => some (toString n)
+  | .str s => some s.quote
+  | _ => none
+
+/-- The options Lake built `mod` with, as `(name, value)`: the `options` of the `.setup.json` Lake
+writes beside the module's other build files, `<build>/ir/A/B.setup.json` for
+`<build>/lib/lean/A/B.olean`. `none` when there is no such file. Needs the search path
+(`initSearchPath`). -/
+def moduleOptions? (mod : Name) : IO (Option (Array (Name × String))) := do
+  let rel := String.intercalate "/" (nameComponents mod)
+  let some olean ← (try some <$> findOLean mod catch _ => pure none) | return none
+  let suffix := s!"lib/lean/{rel}.olean"
+  let oleanPath := olean.toString
+  unless oleanPath.endsWith suffix do return none
+  let setup : System.FilePath := s!"{oleanPath.dropEnd suffix.length}ir/{rel}.setup.json"
+  unless ← setup.pathExists do return none
+  let json ← IO.ofExcept (Json.parse (← IO.FS.readFile setup))
+  let some (.obj options) := (json.getObjVal? "options").toOption | return some #[]
+  return some <| options.toArray.filterMap fun (k, v) => (renderOptionValue v).map (k.toName, ·)
+
+/-- The settings all of `perModule` make, with the same value: set once, at the top of a file. -/
+def commonOptions (perModule : Array (Array (Name × String))) : Array (Name × String) :=
+  match perModule[0]? with
+  | none => #[]
+  | some first => first.filter fun o => perModule.all (·.contains o)
 
 /-- The project namespaces `chunks` reference, in first-mention order and deduplicated: the stubs the
 extracted file needs at its top. -/
@@ -1128,7 +1184,7 @@ closure (declarations to emit); `exposedNames` is every exposed declaration (to 
 to declarations *outside* `keep`). -/
 def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap Name (Array CommandEntry))
     (moduleOrder : Array Name) (exposedNames keep projectNamespaces : Std.HashSet Name)
-    (target : Name) : String := Id.run do
+    (moduleOptions : Std.HashMap Name (Array (Name × String))) (target : Name) : String := Id.run do
   -- Modules contributing at least one kept declaration, in dependency order, with their filtered
   -- (and section-stripped) entries.
   let mut involved : Array (Name × Array CommandEntry) := #[]
@@ -1152,6 +1208,9 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   involved := involved.filter fun (_, entries) =>
     entries.any fun e =>
       e.cls == .decl || (e.cls == .context && e.kind == ``Parser.Command.«attribute» && e.attrIsTranslation)
+  -- The options every module of this file is built with, set once at its top. A module whose
+  -- options are unknown (no `.setup.json`) is left out of the comparison.
+  let common := commonOptions (involved.filterMap fun (m, _) => moduleOptions.get? m)
   -- Exposed declarations *not* emitted in this file: a `variable` binder referencing one of these
   -- would reference an undefined name, so such binders are dropped (see `pruneVariable`).
   -- A private declaration is referred to by its name without the private prefix.
@@ -1219,6 +1278,10 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     -- through several redundant open-paths to the same declaration, which Lean then reports as
     -- ambiguous even though every path resolves to the exact same constant.
     items := items.push { tag := .openSection, text := "section\n" }
+    -- The options this module is built with that the file does not set at its top.
+    for o in moduleOptions.getD modName #[] do
+      unless common.contains o do
+        items := items.push { tag := .soft, text := s!"set_option {o.1} {o.2}\n", setOption? := o }
     for e in entries do
       match e.cls with
       | .context =>
@@ -1298,6 +1361,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     items := items.push { tag := .close, text := "end\n" }
   -- What survives, and — read off it — the namespaces the surviving lines still refer to.
   let kept := dropRedundantOptions (stripEmptyScopes items)
+    (common.foldl (fun m (o, v) => m.insert o v) {})
   let body := String.join (kept.toList.map (·.text))
   let nsStubs := chunkNamespaces kept
   let imports := externalImports env rootPrefix (involved.map (·.1))
@@ -1312,6 +1376,10 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- Replayed `notation`/`macro` commands may mention declarations that appear later in the file;
   -- defer identifier resolution in their right-hand sides to use sites.
   out := out ++ "\nset_option quotPrecheck false\n"
+  unless common.isEmpty do
+    out := out ++ "\n-- The options the project is built with.\n"
+    for (o, v) in common do
+      out := out ++ s!"set_option {o} {v}\n"
   -- Existence stubs for the namespaces the body still names, since an `open Foo` may precede the
   -- `namespace Foo` that (re)creates `Foo` here — and may even refer to a namespace no kept
   -- declaration re-enters.
@@ -1382,11 +1450,15 @@ declarations of the project `ctx` was made for (`MeaningGraph.Context.of env roo
 source files are under `projectDir`. Targets that are not declarations of the project are skipped.
 Returns the number of files written.
 
+`builtinOptions` are Lean's own options, those registered before any module was imported
+(`getOptionDecls` at the start of the process): the options the project is built with are set
+again in the files when they are among these (`isReplayedOption`). Empty, none is.
+
 Each project source file is parsed once. A file then holds its target and, transitively, what each
 declaration in it needs: what `neededDeps` says, the notations its source uses, and the other
 declarations its source command defines. -/
 def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePath)
-    (targets : Array Name) : IO Nat := do
+    (targets : Array Name) (builtinOptions : Std.HashSet Name := {}) : IO Nat := do
   let env := ctx.env
   let rootPrefix := ctx.rootPrefix
   let exposedNames := ctx.exposed
@@ -1407,6 +1479,17 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
   -- Project modules in dependency-first order (the order of `env.header.moduleNames`), restricted to
   -- those that contain an exposed declaration.
   let moduleOrder : Array Name := env.header.moduleNames.filter declsByModule.contains
+  -- The options each module is built with (see "The project's options").
+  let mut moduleOptions : Std.HashMap Name (Array (Name × String)) := {}
+  let mut unknownOptions : Array Name := #[]
+  for modName in moduleOrder do
+    match ← moduleOptions? modName with
+    | some opts =>
+      moduleOptions := moduleOptions.insert modName (opts.filter (isReplayedOption builtinOptions ·.1))
+    | none => unknownOptions := unknownOptions.push modName
+  unless unknownOptions.isEmpty do
+    IO.eprintln s!"challenge-gen: no build options found for {unknownOptions.size} modules \
+      (no .setup.json for {unknownOptions[0]!}, …): their files use Lean's defaults"
   -- Phase 1: process each contributing source file once.
   let mut cache : Std.HashMap Name (Array CommandEntry) := {}
   for modName in moduleOrder do
@@ -1484,7 +1567,7 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
           keep := keep.insert m
           todo := todo.push m
     let content := assembleTarget env rootPrefix cache moduleOrder exposedNames keep
-      projectNamespaces target
+      projectNamespaces moduleOptions target
     IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") content
   return targets.size
 

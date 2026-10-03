@@ -51,6 +51,10 @@ def check(cond, msg):
 for f in out.glob("*.lean"):
     text = f.read_text()
     check("import TrustAnnotations" not in text, f"{f.name} imports TrustAnnotations")
+    check("set_option autoImplicit false" in text and "set_option maxSynthPendingDepth 3" in text,
+          f"{f.name}: an option the project is built with is not set")
+    check("pp.unicode.fun" not in text and "linter.unusedVariables" not in text,
+          f"{f.name}: an option that changes only what Lean reports is set")
     check("@[claim" not in text and "@[domain" not in text, f"{f.name} keeps an annotation")
 
 claim = read("Fixture.pred'_lt")
@@ -87,12 +91,14 @@ local = read("Fixture.quad'")
 check('local notation "⦃" n "⦄" => double (double n)' in local,
       "quad': the local notation it uses is not replayed")
 
-check("variable (g : (Nat → Nat))" in read("Fixture.Pair.app_eq"),
-      "Pair.app_eq: a binder holding parentheses is dropped")
+app_eq = read("Fixture.Pair.app_eq")
+check("variable (g : (Nat → Nat))" in app_eq, "Pair.app_eq: a binder holding parentheses is dropped")
+check(app_eq.count("set_option autoImplicit false") == 1,
+      "Pair.app_eq: its source's setting of an option already set at the top is kept")
 
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
-print("ok: proofs, values, annotations, notation, sections, binders and closures")
+print("ok: proofs, values, annotations, notation, sections, binders, options and closures")
 EOF
 
 (cd "$work/fixture" && lake env "$bin" --root Fixture --decl Fixture.Uses.quad --out "$work/one" >/dev/null)

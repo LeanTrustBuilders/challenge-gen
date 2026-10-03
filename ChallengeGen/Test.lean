@@ -285,6 +285,43 @@ private def optionChunk (name : Name) (value text : String) : OutChunk :=
     optionChunk `autoImplicit "false" "set_option autoImplicit false\n",
     { tag := .close, text := "end\n" }]) == "set_option autoImplicit false\nsection\nend\n"
 
+-- Settings in effect from the start (the project's options, set at the top of the file) count.
+#guard chunkText (dropRedundantOptions #[
+    optionChunk `autoImplicit "false" "set_option autoImplicit false\n",
+    optionChunk `maxHeartbeats "400000" "set_option maxHeartbeats 400000\n",
+    { tag := .hard, text := "def x := 1\n" }]
+    (Std.HashMap.ofList [(`autoImplicit, "false")])) ==
+  "set_option maxHeartbeats 400000\ndef x := 1\n"
+
+/-! ## The project's options -/
+
+private def builtinForTest : Std.HashSet Name :=
+  Std.HashSet.ofList [`autoImplicit, `maxSynthPendingDepth, `backward.isDefEq.lazyWhnfCore,
+    `pp.unicode.fun, `linter.unusedVariables, `warningAsError, `trace.Meta.synthInstance]
+
+-- Lean's own options are set again when they change what a file means or whether it compiles...
+#guard isReplayedOption builtinForTest `autoImplicit
+#guard isReplayedOption builtinForTest `maxSynthPendingDepth
+#guard isReplayedOption builtinForTest `backward.isDefEq.lazyWhnfCore
+-- ...not when they change only what Lean reports, `warningAsError` included (every `sorry` warns)...
+#guard !isReplayedOption builtinForTest `pp.unicode.fun
+#guard !isReplayedOption builtinForTest `linter.unusedVariables
+#guard !isReplayedOption builtinForTest `warningAsError
+#guard !isReplayedOption builtinForTest `trace.Meta.synthInstance
+-- ...and an option a package registers is not known in every file.
+#guard !isReplayedOption builtinForTest `weak.linter.mathlibStandardSet
+#guard !isReplayedOption builtinForTest `mathlib.tactic.category
+
+#guard renderOptionValue (.bool false) == some "false"
+#guard renderOptionValue (toJson (400000 : Nat)) == some "400000"
+#guard renderOptionValue (.str "a b") == some "\"a b\""
+#guard renderOptionValue .null == none
+
+-- Set once at the top: what every module sets, to the same value.
+#guard commonOptions #[#[(`a, "1"), (`b, "2")], #[(`b, "3"), (`a, "1")]] == #[(`a, "1")]
+#guard commonOptions #[#[(`a, "1")], #[]] == #[]
+#guard commonOptions #[] == #[]
+
 /-! ## `openedNamespaces` -/
 
 -- A token spelled relative to a namespace already in scope resolves to the full name, so the stub

@@ -58,6 +58,9 @@ def discoverModules (srcDir : System.FilePath) (root : Name) : IO (Array Name) :
   return mods.qsort (·.toString < ·.toString)
 
 unsafe def main (args : List String) : IO UInt32 := do
+  -- Lean's own options, registered before any module is imported: the only ones every file knows.
+  let builtinOptions : Std.HashSet Name :=
+    (← getOptionDecls).foldl (init := {}) fun s n _ => s.insert n
   -- Imported modules' `initialize` declarations must run, so that their environment extensions are
   -- registered and receive their imported entries: the source is parsed with them.
   enableInitializersExecution
@@ -81,7 +84,7 @@ unsafe def main (args : List String) : IO UInt32 := do
       unless unknown.isEmpty do
         throw <| IO.userError
           s!"not declarations of {cfg.root}: {", ".intercalate (unknown.toList.map toString)}"
-      let n ← writeChallenges ctx cfg.srcDir cfg.out targets
+      let n ← writeChallenges ctx cfg.srcDir cfg.out targets builtinOptions
       IO.println s!"wrote {n} files to {cfg.out}"
       return 0
     catch e =>

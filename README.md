@@ -25,6 +25,10 @@ wrote it. Then:
   sections and namespaces left empty and `set_option` lines with no effect;
 - `noncomputable section` stays; the module system's `@[expose]`, `public` and `meta` go, since the
   file is not a module;
+- the options the project is built with, its lakefile's `leanOptions` as Lake records them for each
+  module, are set again when they are Lean's own and change what the file means or whether it
+  compiles (`autoImplicit`, `maxSynthPendingDepth`, `backward.*`, …), not only what Lean reports
+  (`pp.*`, `linter.*`, `warningAsError`);
 - nothing declared after the target is kept.
 
 What a declaration needs comes from MeaningGraph: what its statement mentions, when its proof became
