@@ -13,16 +13,20 @@ The declarations are copied verbatim, with the `namespace`, `section`, `open`, `
 `universe`, `set_option` and notation commands around them, so the file reads the way its author
 wrote it. Then:
 
-- a theorem's proof is replaced by `sorry`, and so are the proofs inside a definition's value,
-  except a tactic block that is the whole value: Lean decides from it which section variables the
-  definition takes;
+- a proof is replaced by `sorry`: a theorem's, or the value of a command whose declarations are
+  all theorems, such as an instance of a `Prop`-valued class. So are the proofs inside a
+  definition's value, except a tactic block that is the whole value: Lean decides from it which
+  section variables the definition takes;
 - a field's default `:= by tac` becomes `:= sorry`, and a definition's `deriving` clause becomes
   `instance … := sorry`;
 - the annotations of [TrustAnnotations](https://github.com/LeanTrustBuilders/annotations)
   (`@[claim]`, `@[specifies]`, `@[domain]`, …) are removed, with their import and their options,
   and so is `@[ext]` on a theorem;
-- `variable` binders and `omit` entries that mention a declaration left out are dropped, as are
-  sections and namespaces left empty and `set_option` lines with no effect;
+- `variable` binders that mention a declaration left out are dropped, and so are the `include` and
+  `omit` entries naming them; sections and namespaces left empty, and `set_option` lines with no
+  effect, go too;
+- an `instance` written without a name gets the name the project gave it, since Lean would name it
+  otherwise in another file;
 - `noncomputable section` stays; the module system's `@[expose]`, `public` and `meta` go, since the
   file is not a module;
 - the options the project is built with, its lakefile's `leanOptions` as Lake records them for each
@@ -31,11 +35,14 @@ wrote it. Then:
   (`pp.*`, `linter.*`, `warningAsError`);
 - nothing declared after the target is kept.
 
-What a declaration needs comes from MeaningGraph: what its statement mentions, when its proof became
-`sorry`; everything its term mentions, the lemmas its proofs call included, when it is kept whole;
-in both cases its source dependencies (coercion instances, what a notation expands to). The
-notations its source uses come along, and so do the other declarations its command defines
-(`@[to_additive]`, `@[simps]`), each with what it needs in turn.
+What a declaration needs comes from MeaningGraph: what its statement mentions, proofs included,
+when its proof became `sorry`; everything its term mentions, the lemmas its proofs call included,
+when it is kept whole; in both cases its source dependencies (coercion instances, what a notation
+expands to). The notations its source uses come along, and so do the other declarations its
+command defines (`@[to_additive]`, `@[simps]`, `irreducible_def`), each with what it needs in turn.
+
+The project can be a slice of a library (`--root Mathlib.Probability`): the rest of the library is
+then imported, and a module of the slice that those imports already bring is not copied.
 
 ## Use
 
