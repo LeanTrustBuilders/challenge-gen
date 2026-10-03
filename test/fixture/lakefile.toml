@@ -1,0 +1,11 @@
+name = "Fixture"
+defaultTargets = ["Fixture"]
+
+# test/run.sh pins this to the tag of the toolchain ChallengeGen is on.
+[[require]]
+name = "TrustAnnotations"
+git = "https://github.com/LeanTrustBuilders/annotations"
+rev = "main"
+
+[[lean_lib]]
+name = "Fixture"

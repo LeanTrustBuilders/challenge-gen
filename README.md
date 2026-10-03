@@ -1,76 +1,71 @@
 # ChallengeGen
 
-One declaration of a compiled Lean project, turned into a file that compiles on its own: its
-transitive dependencies inlined, its proofs replaced by `sorry`, its imports cut down to the
-external frontier. One such file is a self-contained statement of one problem — which is what makes
-it usable as a challenge for something that has to produce the proof.
+One Lean file per declaration of a compiled project, which compiles on its own: the declaration and
+everything its text needs, copied from the project's source, with proofs replaced by `sorry` and
+imports cut down to what lies outside the project. Such a file states one problem, for whoever has
+to produce the proof.
 
-Depends on Lean core and [`MeaningGraph`](https://github.com/RemyDegenne/meaning-graph), and
-nothing else. It was extracted from the
-[`exposition`](https://github.com/LeanMachineLearning/exposition) repository, whose `referee` tool
-is its first consumer, and is a package of its own so that generating challenges does not drag in
-that tool's build (Verso, SubVerso, MD4Lean, …).
+Depends on Lean core and [MeaningGraph](https://github.com/LeanTrustBuilders/meaning-graph).
 
-## Two tiers
+## What a file holds
 
-Both take the same input and differ only in how they render a declaration.
+The declarations are copied verbatim, with the `namespace`, `section`, `open`, `variable`,
+`universe`, `set_option` and notation commands around them, so the file reads the way its author
+wrote it. Then:
 
-- **`writeAllExtractions`** — the readable tier. Copies the **verbatim source text** of each
-  declaration and replays the surrounding `namespace`/`open`/`variable`/notation context, so
-  notation survives and the file reads the way a mathematician wrote it. Needs the project's source
-  files on disk.
-- **`Flat.writeAllFlatExtractions`** — the robust tier. Renders each declaration from its
-  `ConstantInfo`: fully qualified, `@`-explicit, no notation, no instance search, no context to
-  replay. Never opens a source file. Gives up readability and, with it, the entire class of
-  context-replay failures.
+- a theorem's proof is replaced by `sorry`, and so are the proofs inside a definition's value,
+  except a tactic block that is the whole value: Lean decides from it which section variables the
+  definition takes;
+- a field's default `:= by tac` becomes `:= sorry`, and a definition's `deriving` clause becomes
+  `instance … := sorry`;
+- the annotations of [TrustAnnotations](https://github.com/LeanTrustBuilders/annotations)
+  (`@[claim]`, `@[specifies]`, `@[domain]`, …) are removed, with their import and their options,
+  and so is `@[ext]` on a theorem;
+- `variable` binders and `omit` entries that mention a declaration left out are dropped, as are
+  sections and namespaces left empty and `set_option` lines with no effect;
+- `noncomputable section` stays; the module system's `@[expose]`, `public` and `meta` go, since the
+  file is not a module;
+- nothing declared after the target is kept.
 
-The intended use is both: prefer the readable file, fall back to the flat one for the declarations
-whose readable version does not compile.
+What a declaration needs comes from MeaningGraph: what its statement mentions, when its proof became
+`sorry`; everything its term mentions, the lemmas its proofs call included, when it is kept whole;
+in both cases its source dependencies (coercion instances, what a notation expands to). The
+notations its source uses come along, and so do the other declarations its command defines
+(`@[to_additive]`, `@[simps]`), each with what it needs in turn.
 
-## What you have to supply
+## Use
 
-```lean
-structure ChallengeDecl where
-  name : Name
-  kind : DeclKind
-  moduleName : Name
-  transDeps : Array Name := #[]
+Build the project, and `challenge-gen` with the project's Lean toolchain (`main` or the branch
+`lean-v<toolchain>`), then, in the project:
+
+```
+lake env challenge-gen --root MyProject --decl MyProject.main_theorem --out challenges
 ```
 
-Four fields, and that is the whole interface. This package does **not** decide which declarations
-are worth extracting, and it does **not** compute or choose the dependency closure — a closure that
-dropped a lemma some kept tactic block calls would produce a file that does not compile, so the
-edge policy belongs to whoever knows what the files are for. Take the closure over edges that keep
-proofs; `MeaningGraph.transitiveDeps` is what computes it.
+writes `challenges/MyProject___main_theorem.lean`. Without `--decl`, it writes the file of every
+declaration of the project. The options are in `challenge-gen --help`.
 
-Both entry points also need a live `Environment` with the project imported, so a tool built on this
-runs inside the target project's `lake env`, the way `referee extract` does.
+From Lean, `ChallengeGen.writeChallenges (MeaningGraph.Context.of env root) srcDir out targets`, in
+an environment with the project imported. `anchorIdOf` gives a file's name.
 
-```lean
-import ChallengeGen
+## Limits
 
-open Lean ChallengeGen
+A file does not compile when its text needs something that no dependency records:
+- a constant named by a literal (``` ``foo ```), as metaprograms do;
+- a lemma that a kept tactic block names but its proof does not use (`simp only [foo]`);
+- a registration made by a standalone `attribute` command other than `to_additive` and `to_dual`,
+  such as the `@[simp]` lemmas a kept tactic block relies on.
 
-def writeChallenges (env : Environment) (root : Name) (decls : Array ChallengeDecl)
-    (projectDir out : System.FilePath) : IO Nat :=
-  writeAllExtractions env root decls projectDir out
-```
+## Versions
 
-Each file is named `<anchorIdOf decl.name>.lean`. `anchorIdOf` is exported for exactly that reason:
-a tool that links to these files has to compute the stem the same way the writer does, so there is
-one definition of it and both sides import it.
+`main` is on the Lean toolchain of Mathlib's master. Every hour, the workflow Follow Mathlib's
+toolchain checks: when Mathlib has moved, it keeps the old toolchain on a branch
+`lean-v<toolchain>`, moves `main` to the new one once it builds with its tests, after MeaningGraph
+and TrustAnnotations have moved, and tags it `v<toolchain>`. A build that fails opens an issue
+labelled `toolchain` instead. The branches of older toolchains get no further changes.
 
-## Checks
+## Tests
 
-`lake build ChallengeGenTest` runs the `#guard`s: the pure string and syntax helpers, and the name
-mapping that decides what a file is called. They are elaboration-time, so building the target is
-running them.
-
-The bulk of the extraction is exercised end to end against real projects instead — constructing a
-synthetic `Environment` for those paths is impractical, and what actually matters is whether the
-files compile. The consumer this was extracted from measures that with a script that runs
-`lake env lean` over every generated file.
-
-The test module is `ChallengeGen.Test`, not `Test`: module roots are shared across a whole Lake
-workspace, so a package that claims the top-level name `Test` takes it away from every project that
-requires it.
+`lake build ChallengeGenTest` runs the `#guard` checks in `ChallengeGen/Test.lean`. After
+`lake build`, `test/run.sh` writes the file of every declaration of `test/fixture` and compiles each
+one, then checks what some of them hold.

@@ -1,18 +1,18 @@
 module
 
 public import MeaningGraph
-public import ChallengeGen.Decl
+public import ChallengeGen.Basic
 public import ChallengeGen.SourceSyntax
 
 @[expose] public section
 
 /-!
-# Standalone Lean file extraction (verbatim-source variant)
+# Standalone Lean files from a project's source
 
 This is an adaptation of Matthew Ballard's `EmitStandalone.lean`
 (https://github.com/mattrobball/lean-informal/blob/main/Informal/EmitStandalone.lean).
 
-This variant copies the **verbatim source text** of each declaration and replays the surrounding
+It copies the **verbatim source text** of each declaration and replays the surrounding
 `namespace`/`open`/`variable`/`section` context commands. Notation is therefore preserved exactly as
 written, so the output is readable.
 
@@ -20,13 +20,16 @@ written, so the output is readable.
 
 1. Re-elaborate each project source file against the already-loaded environment
    (`IO.processCommands`) to recover, per command, its `Syntax` and byte range.
-2. Classify each command as a *declaration* (it defines an exposed declaration), a *context* command
-   (`namespace`/`end`/`open`/`variable`/`section`/`set_option`/`universe`), or *skip*.
+2. Classify each command as a *declaration* (it defines a declaration of the project), a *context*
+   command (`namespace`/`end`/`open`/`variable`/`section`/`set_option`/`universe`), or *skip*.
 3. Extract each command's source text by byte position. For theorems, the proof body (`declVal`) is
    replaced by `:= sorry` surgically (the rest of the source is untouched).
-4. Per target, keep the context commands plus the declaration commands in the target's transitive
-   closure, drop now-empty sections, and assemble: external `import`s followed by the bodies in
-   module-dependency order.
+4. Close each target under what its text needs: `MeaningGraph`'s statement dependencies for a
+   declaration whose proof became `sorry`, its term dependencies for one kept whole, and in both
+   cases its source dependencies, the notations its source uses and its command's siblings.
+5. Per target, keep the context commands plus the declaration commands in that closure, drop
+   now-empty sections, and assemble: external `import`s followed by the bodies in module-dependency
+   order.
 
 Each source file is processed **once** and cached; assembling a target then only filters and
 concatenates strings.
@@ -57,6 +60,11 @@ structure CommandEntry where
   src : String
   kind : SyntaxNodeKind
   declNames : Array Name := #[]
+  /-- For a declaration command, whether its value is replaced by `sorry`: a theorem with a value.
+  What it needs is then what its statement needs (see `neededDeps`). -/
+  valueDropped : Bool := false
+  /-- For a `section` command, the command as replayed (`replayedSection`). -/
+  sectionSrc? : Option String := none
   /-- For a `namespace` command, the namespace it opens exactly as spelled in the source (used by
   `activePrefixes` for `variable`-pruning; kept relative/possibly-unqualified on purpose, since
   that pruning logic is unaffected by whether a namespace was entered via its full dotted path or
@@ -109,20 +117,17 @@ structure CommandEntry where
 
 /-- External modules left out of an extracted file's import block even when the project imports them.
 
-`Characterization` is the only one. It provides `@[specifies]` and `@[characterization]` and
-nothing else a formalization refers to: both record links for a reading tool to pick back out of
-the environment, and an extraction of one declaration has nothing to say with them. So the
+`TrustAnnotations` is the only one. It provides the annotation attributes (`annotationAttributes`)
+and nothing a formalization refers to: each records something for a reading tool to pick back out
+of the environment, and an extraction of one declaration has nothing to say with them. So the
 annotations are stripped (`isDroppedAttribute`) along with any option they are tuned by
-(`excludedOptions`), and then the import has nothing left to serve.
+(`excludedOptions`), and then the import has nothing left to serve. A file that does not import it
+compiles wherever the project's other dependencies are available, Mathlib's web editor included.
 
-Keeping it is worse than useless for the `--site-url` link: the web editor has Mathlib and nothing
-else, so a file importing `Characterization` does not compile there at all and the reader's first
-act has to be deleting a line.
-
-The cost is a project that mentions a `Characterization` *constant* (`SpecEntry`, `specEntries`) in
-a declaration this tool extracts — a tool reading annotations, not a formalization writing them.
-Such a declaration loses the import it needs. -/
-def excludedImports : Array Name := #[`Characterization]
+The cost is a project that mentions a `TrustAnnotations` *constant* in a declaration this tool
+extracts — a tool reading annotations, not a formalization writing them. Such a declaration loses
+the import it needs. -/
+def excludedImports : Array Name := #[`TrustAnnotations]
 
 @[inherit_doc excludedImports]
 def isExcludedImport (m : Name) : Bool := excludedImports.any (hasPrefixName m ·)
@@ -130,8 +135,9 @@ def isExcludedImport (m : Name) : Bool := excludedImports.any (hasPrefixName m �
 /-- Option namespaces registered by an `excludedImports` module. A `set_option` naming one of these
 is an `unknown option` error once the import is gone, so both forms — the file-level command and the
 `set_option … in <decl>` prefix — are dropped from the extracted file. `specifies` and
-`characterization` cover `specifies.checkTargetMentioned` and
-`characterization.checkNotCircular`, the two options `Characterization` registers. -/
+`characterization` cover the options `TrustAnnotations` registers
+(`specifies.checkTargetMentioned`, `characterization.checkExistence`,
+`characterization.checkNotCircular`). -/
 def excludedOptions : Array Name := #[`specifies, `characterization]
 
 @[inherit_doc excludedOptions]
@@ -179,9 +185,8 @@ def findDeclVal? (root : Syntax) : Option (String.Pos.Raw × String.Pos.Raw) := 
 /-- True if `stx` declares a `theorem` or `lemma`, whose proof we replace by `sorry`.
 
 `theorem` parses as `Command.declaration` with the keyword node `Command.theorem`; a `lemma` keeps
-its own syntax kind until macro expansion. Which kinds count is `theoremSyntaxKinds`, shared with
-`Collect` so that the two cannot disagree about what a `lemma` is — they did, and a Batteries
-`lemma` had its whole proof emitted here instead of `sorry`. -/
+its own syntax kind until macro expansion. Which kinds count is `theoremSyntaxKinds`: a Batteries `lemma`
+counts as much as Mathlib's. -/
 def isTheoremDecl (stx : Syntax) : Bool := containsSyntaxKind stx theoremSyntaxKinds
 
 /-- True if `stx` declares a `structure` or a `class` (both parse as `Command.structure`, which
@@ -301,6 +306,22 @@ def isContextCmd (stx : Syntax) : Bool :=
 /-- The substring of `source` between two byte positions. -/
 def slice (source : String) (s e : String.Pos.Raw) : String :=
   ({ str := source, startPos := s, stopPos := e } : Substring.Raw).toString
+
+/-- A `section` command as it is replayed: `noncomputable` and the section's name kept, the module
+system's `@[expose]`, `public` and `meta` dropped, since an extracted file is not a module.
+
+`noncomputable` has to stay: a definition relying on it (`Classical.choice`, real division) does
+not compile without it. The header is read from the source text before the `section` keyword, the
+name from the parsed syntax (`sectionHeader "section" (ident)?`). -/
+def replayedSection (source : String) (stx : Syntax) : String :=
+  let header := match stx.getPos?, stx[1].getPos? with
+    | some s, some e => slice source s e
+    | _, _ => ""
+  let noncomputable_ := (header.splitOn "noncomputable").length > 1
+  let name := match stx[2].getOptional? with
+    | some id => s!" {id.getId}"
+    | none => ""
+  (if noncomputable_ then "noncomputable " else "") ++ "section" ++ name
 
 /-- The source `[cmdStart, cmdEnd)` with each edit applied: `(s, e, repl)` replaces the byte range
 `[s, e)` with `repl`; a zero-width range (`s == e`) is an insertion. Edits must be non-overlapping. -/
@@ -431,6 +452,12 @@ def binderTypeHead? (binderSrc : String) : Option Name :=
     toks[0]?.map (·.toName)
   | _ => none
 
+/-- The attributes of `TrustAnnotations`: `@[claim]`, `@[specifies]`, `@[characterization]`,
+`@[example_of]`, `@[nonexample_of]`, `@[domain]` and `@[up_to]`. Each records something for a
+reading tool and changes nothing a later declaration elaborates against. -/
+def annotationAttributes : List String :=
+  ["claim", "specifies", "characterization", "example_of", "nonexample_of", "domain", "up_to"]
+
 /-- True if this attribute must be dropped from an extracted declaration, given `attrSrc`, the
 source text of a single attribute inside an `@[…]` group.
 
@@ -441,20 +468,19 @@ Two cases:
   `Indistinguishable.refl`). Since that dependency runs through an attribute rather than through any
   term, it is invisible to the dependency analysis and the lemma is not in the closure. Registering
   the lemma for the `ext` tactic is of no use in a file whose proofs are all `sorry`.
-* `@[specifies]` and `@[characterization]`: their only effect is to record a link for a reading
-  tool to pick back out (`Characterization`), which says nothing in a one-declaration file — a
-  characterization's three parts are three separate declarations, so an extraction of any one of
-  them has at most a third of the claim. Dropping them is what lets `excludedImports` leave the
-  `Characterization` import out of the header — the two go together, since an unimported attribute
-  is a hard error.
+* The `annotationAttributes`: their only effect is to record something for a reading tool to pick
+  back out, which says nothing in a one-declaration file — a characterization's parts are separate
+  declarations, so an extraction of any one of them has at most a part of the claim. Dropping them
+  is what lets `excludedImports` leave the `TrustAnnotations` import out of the header — the two go
+  together, since an unimported attribute is a hard error.
 
 Three near neighbours are deliberately **kept**, each because it *produces* something the rest of
 the file may depend on rather than merely registering one:
 
 * `@[ext]` on a `structure`/`class` (hence the `onStructure` guard) is what defines `Foo.ext` and
   `Foo.ext_iff` in the first place; only the theorem form is inert.
-* plain `@[to_additive]` generates the additive sibling — the very thing `commandSiblings` in
-  `writeAllExtractions` works to keep elaborable.
+* plain `@[to_additive]` generates the additive sibling — the very thing the command siblings in
+  `writeChallenges` work to keep elaborable.
 * `@[to_additive existing]` looks inert (it links to a counterpart declared elsewhere rather than
   generating one) but is not: the link it registers is what lets *later* plain `@[to_additive]`
   commands translate a type mentioning the multiplicative declaration. Dropping it was measured to
@@ -471,12 +497,19 @@ def isDroppedAttribute (onStructure : Bool) (attrSrc : String) : Bool :=
   let toks := if toks[0]? == some "local" || toks[0]? == some "scoped" then toks.drop 1 else toks
   match toks[0]? with
   | some "ext" => !onStructure
-  | some "specifies" => true
-  | some "characterization" => true
-  | _ => false
+  | some t => annotationAttributes.contains t
+  | none => false
+
+/-- The position after the whitespace that starts at `p` in `source`. -/
+def skipWhitespace (source : String) (p : String.Pos.Raw) : String.Pos.Raw := Id.run do
+  let mut p := p
+  while p.byteIdx < source.utf8ByteSize && (p.get source).isWhitespace do
+    p := p.next source
+  return p
 
 /-- Source edits dropping every `isDroppedAttribute` from the `@[…]` groups in `root`. A group is
-re-rendered from the attributes that survive, or removed outright when none do. -/
+re-rendered from the attributes that survive, or removed outright, with the whitespace after it,
+when none do. -/
 partial def attributeStripEdits (source : String) (root : Syntax) (onStructure : Bool) :
     Array (String.Pos.Raw × String.Pos.Raw × String) := Id.run do
   let mut acc : Array (String.Pos.Raw × String.Pos.Raw × String) := #[]
@@ -495,8 +528,10 @@ partial def attributeStripEdits (source : String) (root : Syntax) (onStructure :
           | _, _ => none
         let kept := texts.filter (!isDroppedAttribute onStructure ·)
         if kept.size != texts.size then
-          let repl := if kept.isEmpty then "" else "@[" ++ ", ".intercalate kept.toList ++ "]"
-          acc := acc.push (s, e, repl)
+          if kept.isEmpty then
+            acc := acc.push (s, skipWhitespace source e, "")
+          else
+            acc := acc.push (s, e, "@[" ++ ", ".intercalate kept.toList ++ "]")
       | _, _ => pure ()
     else
       for a in stx.getArgs do
@@ -587,9 +622,10 @@ def decomposeOmit? (source : String) (stx : Syntax) :
 
 /-- Re-elaborates `source` against `env` (`parseCommands`) and classifies every command. `declPos`
 maps the byte index of each exposed declaration's range start to its name (so a command is a
-declaration command iff some such position falls inside it). -/
+declaration command iff some such position falls inside it). `notationKinds` maps the syntax kind of
+each exposed notation, read without the prefix of a private name, to its declaration. -/
 def processFile (env : Environment) (source : String) (filePath : String)
-    (declPos : Std.HashMap Nat Name) (notationKinds : Std.HashSet Name) :
+    (declPos : Std.HashMap Nat Name) (notationKinds : Std.HashMap Name Name) :
     IO (Array CommandEntry) := do
   let commands ← parseCommands env source filePath
   let mut entries : Array CommandEntry := #[]
@@ -603,6 +639,12 @@ def processFile (env : Environment) (source : String) (filePath : String)
   -- empty stub for the bare name and the real (populated) one for the qualified name, which can
   -- make an unqualified reference to a member of the real one ambiguous.
   let mut nsPrefixStack : Array Name := #[Name.anonymous]
+  -- The `end` commands closing the scopes open so far, innermost last. A file may leave scopes open
+  -- at its end — `noncomputable section` at the top of a file, with no `end`, is the usual case — and
+  -- each one is closed after the file's last command, so that every module's commands are balanced
+  -- in the extracted file. Otherwise the scope would swallow the `end` of the `section` each module
+  -- is wrapped in, and everything after it would sit in that module's scope.
+  let mut closers : Array String := #[]
   for stx in commands do
     let some cmdStart := stx.getPos? | continue
     let some cmdEnd := stx.getTailPos? | continue
@@ -666,21 +708,33 @@ def processFile (env : Environment) (source : String) (filePath : String)
         match decomposeOmit? source stx with
         | some (binders, innerStart) => (binders, some (mkSrc innerStart))
         | none => (#[], none)
-      let usedNotations := notationKinds.toArray.filter (collectSyntaxKinds stx).contains
+      let usedNotations := (collectSyntaxKinds stx).toArray.filterMap fun k =>
+        notationKinds.get? (privateToUserName k)
+      let valueDropped := isTheoremDecl stx && (findDeclVal? stx).isSome
       entries := entries.push
-        { cls := .decl, src, kind := stx.getKind, declNames := names, appended, usedNotations,
-          omitBinders, srcNoOmit? }
+        { cls := .decl, src, kind := stx.getKind, declNames := names, valueDropped, appended,
+          usedNotations, omitBinders, srcNoOmit? }
     else if isContextCmd stx then
       let kind := stx.getKind
       let nsName? := if kind == ``Parser.Command.namespace && stx.getArgs.size ≥ 2 then
         some stx[1].getId else none
       let qualifiedNsName? := nsName?.map (nsPrefixStack.back! ++ ·)
+      let sectionSrc? := if kind == ``Parser.Command.«section» && stx.getArgs.size ≥ 3 then
+        some (replayedSection source stx) else none
       if let some ns := qualifiedNsName? then
         nsPrefixStack := nsPrefixStack.push ns
       else if kind == ``Parser.Command.«section» then
         nsPrefixStack := nsPrefixStack.push nsPrefixStack.back!
       else if kind == ``Parser.Command.«end» && nsPrefixStack.size > 1 then
         nsPrefixStack := nsPrefixStack.pop
+      if let some ns := nsName? then
+        closers := closers.push s!"end {ns}"
+      else if kind == ``Parser.Command.«section» then
+        closers := closers.push <| match stx[2]?.bind (·.getOptional?) with
+          | some id => s!"end {id.getId}"
+          | none => "end"
+      else if kind == ``Parser.Command.«end» then
+        closers := closers.pop
       let binders := if kind == ``Parser.Command.«variable» then
         decomposeVariable source stx else #[]
       -- `openOnly` is `open NS (a b c)`, parsed as 4 children: the `NS` ident, the `(` token, a
@@ -698,10 +752,13 @@ def processFile (env : Environment) (source : String) (filePath : String)
         | some (attrs, targets) => (targets, attrs.any isTranslationAttribute)
         | none => (#[], false)
       entries := entries.push
-        { cls := .context, src := slice source cmdStart cmdEnd, kind, nsName?, qualifiedNsName?,
-          binders, openOnlyNamespace?, openOnlyIdents, attrTargets, attrIsTranslation }
+        { cls := .context, src := slice source cmdStart cmdEnd, kind, sectionSrc?, nsName?,
+          qualifiedNsName?, binders, openOnlyNamespace?, openOnlyIdents, attrTargets,
+          attrIsTranslation }
     else
       entries := entries.push { cls := .skip, src := slice source cmdStart cmdEnd, kind := stx.getKind }
+  for closer in closers.reverse do
+    entries := entries.push { cls := .context, src := closer, kind := ``Parser.Command.«end» }
   return entries
 
 /-! ## Phase 2: per-target filtering and section stripping -/
@@ -913,12 +970,29 @@ def collapseBlankRuns (s : String) : String :=
     | [] => [line]
   "\n".intercalate collapsed.reverse
 
+/-- Whether `chunks` is a single scope: an opening chunk first, and the chunk closing it last. -/
+def isOneScope (chunks : Array OutChunk) : Bool := Id.run do
+  unless chunks[0]?.any (fun c => c.tag == .openSection || c.tag == .openNamespace) do return false
+  let mut depth : Int := 0
+  for i in [0:chunks.size] do
+    match chunks[i]!.tag with
+    | .openSection | .openNamespace => depth := depth + 1
+    | .close => depth := depth - 1
+    | _ => pure ()
+    if depth == 0 then return i + 1 == chunks.size
+  return false
+
 /-- Drops `section` and `namespace` scopes that contain no declarations and no context beyond the
 `soft` commands (`variable`/`open`/`set_option`/`universe`), which are scoped to the dropped block
 and hence safe to remove with it. A scope is kept iff it (transitively) contains a `hard` chunk;
 otherwise the whole `… end` block — `soft` lines included — is dropped. Because matching
 opens/closes are tracked on a stack, nesting stays balanced regardless of how deep an empty block
-is. -/
+is.
+
+A plain `section … end` holding nothing but one scope is that scope, and is replaced by it: every
+module is wrapped in a `section`, and a module whose commands sit in a scope of their own —
+`noncomputable section`, the module system's `@[expose] public section` — would otherwise read as two
+nested sections. -/
 def stripEmptyScopes (items : Array OutChunk) : Array OutChunk := Id.run do
   -- Stack of open scopes: (open chunk, accumulated inner chunks, must be kept?).
   let mut stack : Array (OutChunk × Array OutChunk × Bool) := #[]
@@ -935,7 +1009,10 @@ def stripEmptyScopes (items : Array OutChunk) : Array OutChunk := Id.run do
         let (openChunk, inner, hasContent) := stack.back!
         stack := stack.pop
         if hasContent then
-          let rendered := (#[openChunk] ++ inner).push c
+          let rendered :=
+            if openChunk.tag == .openSection && openChunk.text == "section\n" && isOneScope inner
+            then inner
+            else (#[openChunk] ++ inner).push c
           if stack.isEmpty then
             top := top ++ rendered
           else
@@ -1071,8 +1148,9 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
       e.cls == .decl || (e.cls == .context && e.kind == ``Parser.Command.«attribute» && e.attrIsTranslation)
   -- Exposed declarations *not* emitted in this file: a `variable` binder referencing one of these
   -- would reference an undefined name, so such binders are dropped (see `pruneVariable`).
+  -- A private declaration is referred to by its name without the private prefix.
   let excludedNames : Std.HashSet Name := exposedNames.fold (init := {}) fun s n =>
-    if keep.contains n then s else s.insert n
+    if keep.contains n then s else (s.insert n).insert (privateToUserName n)
   -- All names bound by `variable` commands in this file: these are local, so an identifier matching
   -- one is not a reference to a same-named global declaration (e.g. the project's top-level `Ω`).
   let boundVars : Std.HashSet Name := Id.run do
@@ -1138,10 +1216,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for e in entries do
       match e.cls with
       | .context =>
-        let trimmedSrc := e.src.trimAsciiStart.toString
-        if trimmedSrc.startsWith "@[expose]" || (trimmedSrc.splitOn "public section").length > 1 then
-          pure ()   -- drop the module-system `@[expose] public section` wrapper
-        else if e.kind == ``Parser.Command.«variable» then
+        if e.kind == ``Parser.Command.«variable» then
           if let some v := pruneVariable env rootPrefix excludedNames activePrefixes boundVars
               boundVarTypes e then
             items := items.push { tag := .soft, text := v ++ "\n" }
@@ -1154,7 +1229,9 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
             { tag := .openNamespace, text := e.src ++ "\n"
               namespaces := e.qualifiedNsName?.toArray }
         else if e.kind == ``Parser.Command.«section» then
-          items := items.push { tag := .openSection, text := e.src ++ "\n" }
+          -- Every form of `section`, the module system's `@[expose] public section` included, as
+          -- `replayedSection` renders it. An empty one goes in `stripEmptyScopes`.
+          items := items.push { tag := .openSection, text := e.sectionSrc?.getD e.src ++ "\n" }
         else if e.kind == ``Parser.Command.«end» then
           items := items.push { tag := .close, text := e.src ++ "\n" }
         else if e.kind == ``Parser.Command.«attribute» then
@@ -1220,11 +1297,9 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   let imports := externalImports env rootPrefix (involved.map (·.1))
   -- The extracted files are terminal and self-contained (nothing imports them), so the source's
   -- module-system scaffolding (`module` header, `public import`, `@[expose] public section`) is
-  -- unnecessary: plain `import`s suffice, and the `@[expose] public section` wrappers are dropped
-  -- above.
-  let importBlock := if imports.isEmpty then "import Mathlib\n" else
-    String.join (imports.toList.map (fun i => s!"import {i}\n"))
-  let mut out := importBlock
+  -- unnecessary: plain `import`s suffice, and the sections are replayed without it
+  -- (`replayedSection`).
+  let mut out := String.join (imports.toList.map (fun i => s!"import {i}\n"))
   out := out ++ s!"\n/-! # Standalone extraction for `{target}`\n"
     ++ "Definitions are copied verbatim; theorem proofs are replaced by `sorry`.\n"
     ++ "Auto-generated by ChallengeGen. -/\n"
@@ -1239,38 +1314,90 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for ns in nsStubs do
       out := out ++ s!"namespace {ns}\nend {ns}\n"
   out := out ++ body
-  return (collapseBlankRuns out).trimAsciiEnd.toString ++ "\n"
+  return (collapseBlankRuns out).trimAscii.toString ++ "\n"
 
 /-! ## Driver -/
 
-/-- Computes the byte index (in `source`) of the start of each exposed declaration's range, for the
+/-- Computes the byte index (in `source`) of the start of each declaration's range, for the
 declarations in `modDecls`. -/
-def declPositions (env : Environment) (source : String) (modDecls : Array ChallengeDecl) :
+def declPositions (env : Environment) (source : String) (modDecls : Array Name) :
     IO (Std.HashMap Nat Name) := do
   let fileMap := FileMap.ofString source
   let mut m : Std.HashMap Nat Name := {}
-  for decl in modDecls do
-    if let some ranges ← findRanges? env decl.name then
-      m := m.insert (fileMap.ofPosition ranges.range.pos).byteIdx decl.name
+  for name in modDecls do
+    if let some ranges ← findRanges? env name then
+      m := m.insert (fileMap.ofPosition ranges.range.pos).byteIdx name
   return m
 
-/-- Writes a verbatim standalone `<anchorId>.lean` file for every declaration in `decls` into `dir`.
-Each project source file is processed once; targets are then assembled by filtering. Returns the
-number of files written. -/
-def writeAllExtractions (env : Environment) (rootPrefix : Name)
-    (decls : Array ChallengeDecl) (projectDir : System.FilePath)
-    (dir : System.FilePath) : IO Nat := do
-  let exposedNames : Std.HashSet Name := decls.foldl (·.insert ·.name) {}
-  -- Exposed notation parsers; a declaration's source uses one iff its parsed syntax contains a node
-  -- of that kind (the notation's name).
-  let notationKinds : Std.HashSet Name :=
-    decls.foldl (init := {}) fun s d => if isNotationKind env d.name then s.insert d.name else s
-  -- Every project namespace, taken as the proper-prefix ancestors of the exposed declaration names.
-  let projectNamespaces : Std.HashSet Name := decls.foldl (init := {}) fun s d =>
-    (namespaceAncestors d.name.getPrefix).foldl (·.insert ·) s
+/-- What the emitted text of each of `names` needs, from `MeaningGraph`, in the order of `names`.
+
+A declaration whose value is replaced by `sorry` (`valueDropped`) needs what its statement mentions:
+its `statement` edges, and every constant its type mentions, proofs included, looked through the
+constants that are not declarations (`MeaningGraph.expandThrough`). The statement edges erase
+proofs, but the statement's text needs them: an instance of a `Prop`-valued class is a proof, and
+the file must declare it for instance search to find it. Any other is emitted whole and needs what its term mentions, the lemmas its
+proofs call included: its `term` edges. Proofs inside a definition are mostly replaced by `sorry`
+too, but not the tactic blocks that make up a whole value (`wholeValueTacticRanges`), and those
+run in the extracted file. Both add the `source` dependencies, what the source needs and no term
+mentions: coercion instances, and the constants a notation expands to. -/
+def neededDeps (ctx : MeaningGraph.Context) (cache : MeaningGraph.Cache)
+    (valueDropped : Name → Bool) (names : Array Name) :
+    MetaM (Array (Name × Array Name) × MeaningGraph.Context × MeaningGraph.Cache) := do
+  let (ofDropped, ctx) ← ctx.depsOf (names.filter valueDropped) (term := false)
+  let (ofWhole, ctx) ← ctx.depsOf (names.filter (!valueDropped ·)) (term := true)
+  let mut byName : Std.HashMap Name (Array Name) := {}
+  for (n, d) in ofDropped do byName := byName.insert n d.statement
+  for (n, d) in ofWhole do byName := byName.insert n d.term
+  let mut cache := cache
+  let mut out := #[]
+  for n in names do
+    let deps := byName.getD n #[]
+    match ctx.env.find? n with
+    | some info =>
+      let (source, c) := ctx.sourceDeps cache n info
+      cache := c
+      let mut deps := deps ++ source
+      if valueDropped n then
+        let (ofType, c) := MeaningGraph.expandThrough ctx.env (!ctx.isNode ·) cache
+          (MeaningGraph.usedConstantsOf ctx.env n info (includeValue := false))
+        cache := c
+        deps := deps ++ ofType
+      out := out.push (n, deps)
+    | none => out := out.push (n, deps)
+  return (out, ctx, cache)
+
+/-- The project's declarations, in environment order: `MeaningGraph`'s, under the rule
+`ltb-meaning/1`. -/
+def projectDeclarations (ctx : MeaningGraph.Context) : Array Name :=
+  ctx.constants.filterMap fun (n, _, _) => if ctx.exposed.contains n then some n else none
+
+/-- Writes a standalone `<anchorIdOf target>.lean` file into `dir` for each of `targets`, the
+declarations of the project `ctx` was made for (`MeaningGraph.Context.of env rootPrefix`), whose
+source files are under `projectDir`. Targets that are not declarations of the project are skipped.
+Returns the number of files written.
+
+Each project source file is parsed once. A file then holds its target and, transitively, what each
+declaration in it needs: what `neededDeps` says, the notations its source uses, and the other
+declarations its source command defines. -/
+def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePath)
+    (targets : Array Name) : IO Nat := do
+  let env := ctx.env
+  let rootPrefix := ctx.rootPrefix
+  let exposedNames := ctx.exposed
+  -- Exposed notation parsers, by syntax kind; a declaration's source uses one iff its parsed syntax
+  -- contains a node of that kind. The kind is the parser's name, both read without the prefix of a
+  -- private name: a `local notation` declares a private parser, and its nodes, parsed again here,
+  -- carry another private prefix than the declaration's.
+  let notationKinds : Std.HashMap Name Name := exposedNames.fold (init := {}) fun m n =>
+    if isNotationKind env n then m.insert (privateToUserName n) n else m
+  -- Every project namespace, taken as the proper-prefix ancestors of the exposed declaration names
+  -- (a private name read as its author wrote it).
+  let projectNamespaces : Std.HashSet Name := exposedNames.fold (init := {}) fun s n =>
+    (namespaceAncestors (privateToUserName n).getPrefix).foldl (·.insert ·) s
   -- Group exposed declarations by module.
-  let declsByModule : Std.HashMap Name (Array ChallengeDecl) :=
-    decls.foldl (fun m d => m.insert d.moduleName ((m.getD d.moduleName #[]).push d)) {}
+  let declsByModule : Std.HashMap Name (Array Name) :=
+    ctx.constants.foldl (init := {}) fun m (n, mod, _) =>
+      if exposedNames.contains n then m.insert mod ((m.getD mod #[]).push n) else m
   -- Project modules in dependency-first order (the order of `env.header.moduleNames`), restricted to
   -- those that contain an exposed declaration.
   let moduleOrder : Array Name := env.header.moduleNames.filter declsByModule.contains
@@ -1289,13 +1416,15 @@ def writeAllExtractions (env : Environment) (rootPrefix : Name)
   -- Map each declaration to every exposed declaration its own source command also defines.
   --
   -- One command routinely declares several constants: `@[to_additive]` produces a multiplicative
-  -- and an additive version, `@[simps]` adds projection lemmas. The dependency closure is computed
-  -- per *declaration*, but extraction emits whole *commands* (`restrictToTarget` keeps a command
-  -- when any one of its declarations is in `keep`), so keeping one sibling emits the others too —
-  -- and they must then elaborate. Concretely: a target needing only `toGermAddMonoidHom` emits the
-  -- `@[to_additive] def toGermMonoidHom` command it comes from, whose *multiplicative* spelling
-  -- needs `Monoid`-side instances that the additive closure never mentions.
+  -- and an additive version, `@[simps]` adds projection lemmas. Extraction emits whole *commands*
+  -- (`restrictToTarget` keeps a command when any one of its declarations is in `keep`), so keeping
+  -- one sibling emits the others too — and they must then elaborate. Concretely: a target needing
+  -- only `toGermAddMonoidHom` emits the `@[to_additive] def toGermMonoidHom` command it comes from,
+  -- whose *multiplicative* spelling needs `Monoid`-side instances that the additive one never
+  -- mentions.
   let mut commandSiblings : Std.HashMap Name (Array Name) := {}
+  -- The declarations whose value is replaced by `sorry`.
+  let mut valueDropped : Std.HashSet Name := {}
   for (_, entries) in cache.toList do
     for e in entries do
       if e.cls == .decl then
@@ -1305,41 +1434,52 @@ def writeAllExtractions (env : Environment) (rootPrefix : Name)
         if e.declNames.size > 1 then
           for nm in e.declNames do
             commandSiblings := commandSiblings.insert nm e.declNames
-  -- Each exposed declaration's own closure, used to re-close `keep` around a newly pulled-in
-  -- sibling (which arrives with requirements of its own).
-  let transDepsOf : Std.HashMap Name (Array Name) :=
-    decls.foldl (fun m d => m.insert d.name (d.transDeps.filter exposedNames.contains)) {}
-  -- Phase 3: assemble and write one file per declaration.
-  IO.FS.createDirAll dir
-  for decl in decls do
-    let mut keep : Std.HashSet Name :=
-      (decl.transDeps.filter exposedNames.contains).foldl (·.insert ·) ({} : Std.HashSet Name)
-        |>.insert decl.name
-    -- Close `keep` to a fixpoint under:
-    --  * notation usage — a kept declaration whose source uses a notation needs that notation's
-    --    command replayed, and notations may themselves use further notations;
-    --  * source-command siblings (`commandSiblings`) — emitting a command emits every declaration
-    --    it defines, so each sibling must be present and elaborable;
-    --  * the transitive dependencies of anything the two steps above newly added.
-    -- The last step is skipped on the first round: those names come from `decl.transDeps`, which
-    -- is already closed under `closureDeps`, so expanding them again would only re-walk the closure
-    -- of every member for no gain.
-    let mut frontier : Array Name := keep.toArray
-    let mut closeDeps := false
+        if e.valueDropped then
+          valueDropped := e.declNames.foldl (·.insert ·) valueDropped
+  -- Phase 2: the graph the files are closed under, for what the targets reach. A declaration's
+  -- edges are what its text needs (`neededDeps`), the notations its source uses, and its command's
+  -- siblings, each of which arrives with needs of its own.
+  let targets := targets.filter exposedNames.contains
+  let edges ← runMetaIO env do
+    let mut ctx := ctx
+    let mut sourceCache : MeaningGraph.Cache := {}
+    let mut edges : Std.HashMap Name (Array Name) := {}
+    let mut seen : Std.HashSet Name := {}
+    let mut frontier : Array Name := #[]
+    for t in targets do
+      unless seen.contains t do
+        seen := seen.insert t
+        frontier := frontier.push t
     while !frontier.isEmpty do
+      let (needed, c, sc) ← neededDeps ctx sourceCache valueDropped.contains frontier
+      ctx := c
+      sourceCache := sc
       let mut next : Array Name := #[]
-      for n in frontier do
-        let extra := declUsedNotations.getD n #[] ++ commandSiblings.getD n #[]
-          ++ (if closeDeps then transDepsOf.getD n #[] else #[])
-        for m in extra do
-          unless keep.contains m do
-            keep := keep.insert m
+      for (n, deps) in needed do
+        let out := (deps ++ declUsedNotations.getD n #[] ++ commandSiblings.getD n #[]).filter
+          fun m => m != n && exposedNames.contains m
+        edges := edges.insert n out
+        for m in out do
+          unless seen.contains m do
+            seen := seen.insert m
             next := next.push m
       frontier := next
-      closeDeps := true
+    return edges
+  -- Phase 3: assemble and write one file per target.
+  IO.FS.createDirAll dir
+  for target in targets do
+    let mut keep : Std.HashSet Name := ({} : Std.HashSet Name).insert target
+    let mut todo : Array Name := #[target]
+    while !todo.isEmpty do
+      let n := todo.back!
+      todo := todo.pop
+      for m in edges.getD n #[] do
+        unless keep.contains m do
+          keep := keep.insert m
+          todo := todo.push m
     let content := assembleTarget env rootPrefix cache moduleOrder exposedNames keep
-      projectNamespaces decl.name
-    IO.FS.writeFile (dir / s!"{anchorIdOf decl.name}.lean") content
-  return decls.size
+      projectNamespaces target
+    IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") content
+  return targets.size
 
 end ChallengeGen

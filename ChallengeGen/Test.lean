@@ -10,10 +10,9 @@ meta import ChallengeGen
 /-!
 # Tests for `ChallengeGen`
 
-The bulk of extraction renders declarations from the elaborated environment and is exercised
-end-to-end against a real project (constructing a synthetic `Environment`/`Syntax` for those paths is
-impractical). Here we unit-test the pure string/syntax helpers, plus the name mapping that decides
-what an extracted file is called.
+The extraction as a whole is exercised end to end on the fixture project (`test/run.sh`), whose
+generated files must compile. Here we unit-test the pure string/syntax helpers, plus the name
+mapping that decides what an extracted file is called.
 
 Each check is a `#guard`, so any regression turns into a build error. Run with
 `lake build ChallengeGenTest`.
@@ -85,14 +84,20 @@ the ones that *generate* declarations the closure may depend on must survive. -/
 #guard !isDroppedAttribute false "simp"
 #guard !isDroppedAttribute false "refl"
 
--- `@[specifies]` records a link for a reading tool to pick back out and does nothing in a
--- standalone file. It is dropped in every form, which is what lets `isExcludedImport` withhold
--- the `Characterization` import.
+-- The annotations of `TrustAnnotations` record something for a reading tool and do nothing in a
+-- standalone file. They are dropped in every form, which is what lets `isExcludedImport` withhold
+-- the `TrustAnnotations` import.
 #guard isDroppedAttribute false "specifies"
 #guard isDroppedAttribute false "specifies entropy"
 #guard isDroppedAttribute false "specifies entropy \"agrees with the textbook formula\""
 #guard isDroppedAttribute true "specifies"
 #guard !isDroppedAttribute false "specifies_foo"
+#guard isDroppedAttribute false "claim"
+#guard isDroppedAttribute false "claim \"the main theorem\""
+#guard isDroppedAttribute false "example_of IsPrime"
+#guard isDroppedAttribute false "nonexample_of IsPrime"
+#guard isDroppedAttribute false "domain (0 < n) \"the predecessor of 0 is 0\""
+#guard isDroppedAttribute false "up_to (fun f g => f =ᵐ[μ] g)"
 
 -- `@[characterization]` is the same story, and the `true` case matters more here: the property of a
 -- characterization is often a `structure` or a `class`.
@@ -112,19 +117,19 @@ the ones that *generate* declarations the closure may depend on must survive. -/
 
 /-! ## `isExcludedImport` / `isExcludedOption`
 
-`Characterization` carries the `@[specifies]` and `@[characterization]` attributes and nothing a
-formalization refers to; since every annotation is stripped, the extracted file must not import
-it — the web editor has Mathlib only. Whatever the dropped import registered has to go with it,
-options included. -/
+`TrustAnnotations` carries the annotation attributes and nothing a formalization refers to; since
+every annotation is stripped, the extracted file must not import it. Whatever the dropped import
+registered has to go with it, options included. -/
 
-#guard isExcludedImport `Characterization
-#guard isExcludedImport `Characterization.Basic -- a submodule, were the package ever to grow one
+#guard isExcludedImport `TrustAnnotations
+#guard isExcludedImport `TrustAnnotations.Specification
 -- Component-wise, so a project whose name merely starts the same way is untouched.
-#guard !isExcludedImport `CharacterizationExtra
+#guard !isExcludedImport `TrustAnnotationsExtra
 #guard !isExcludedImport `Mathlib
-#guard !isExcludedImport `Mathlib.Order.Characterization
+#guard !isExcludedImport `Mathlib.Order.TrustAnnotations
 
 #guard isExcludedOption `specifies.checkTargetMentioned
+#guard isExcludedOption `characterization.checkExistence
 #guard isExcludedOption `characterization.checkNotCircular
 #guard !isExcludedOption `maxHeartbeats
 #guard !isExcludedOption `linter.all
@@ -179,6 +184,39 @@ private def chunkText (cs : Array OutChunk) : String := String.join (cs.toList.m
     { tag := .close, text := "end\n" },
     { tag := .hard, text := "def x := 1\n" },
     { tag := .close, text := "end A\n" }]) == "namespace A\ndef x := 1\nend A\n"
+
+-- A plain section holding nothing but one scope is that scope.
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openSection, text := "section\n" },
+    { tag := .openSection, text := "noncomputable section\n" },
+    { tag := .hard, text := "def x := 1\n" },
+    { tag := .close, text := "end\n" },
+    { tag := .close, text := "end\n" }]) == "noncomputable section\ndef x := 1\nend\n"
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openSection, text := "section\n" },
+    { tag := .openSection, text := "section\n" },
+    { tag := .hard, text := "def x := 1\n" },
+    { tag := .close, text := "end\n" },
+    { tag := .close, text := "end\n" }]) == "section\ndef x := 1\nend\n"
+-- ...but not when it holds something besides, which the inner scope does not cover.
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openSection, text := "section\n" },
+    { tag := .soft, text := "open A\n" },
+    { tag := .openSection, text := "noncomputable section\n" },
+    { tag := .hard, text := "def x := 1\n" },
+    { tag := .close, text := "end\n" },
+    { tag := .close, text := "end\n" }]) ==
+  "section\nopen A\nnoncomputable section\ndef x := 1\nend\nend\n"
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openSection, text := "section\n" },
+    { tag := .openNamespace, text := "namespace A\n" },
+    { tag := .hard, text := "def x := 1\n" },
+    { tag := .close, text := "end A\n" },
+    { tag := .openNamespace, text := "namespace B\n" },
+    { tag := .hard, text := "def y := 1\n" },
+    { tag := .close, text := "end B\n" },
+    { tag := .close, text := "end\n" }]) ==
+  "section\nnamespace A\ndef x := 1\nend A\nnamespace B\ndef y := 1\nend B\nend\n"
 
 -- Stubs are read off what survived: the dropped block's namespace is not asked for.
 #guard chunkNamespaces (stripEmptyScopes #[

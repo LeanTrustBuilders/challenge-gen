@@ -7,20 +7,10 @@ public import Lean
 /-!
 # Re-parsing a project's source, and reading declaration keywords off the syntax
 
-Two things the extraction and the tool producing its input both need, and answered separately
-before this module existed: re-parsing a source file against the already-loaded environment, and
-searching a command's syntax tree for a node of a given kind.
-
-Neither is incidental to one of them. A producer reads a declaration's *keyword* this way — which
-cannot be recovered from the compiled environment, since Mathlib's `lemma` is a macro that rewrites
-itself to `theorem` before elaboration — and `Extract` decides from the same syntax whether a
-command is a theorem whose proof should be replaced by `sorry`. They were asking the same question
-of the same parse.
-
-Keeping the answer in one place matters beyond tidiness: the two copies had already drifted.
-`Extract.isTheoremDecl` matched Mathlib's `lemma` but not the Batteries command it overrides, so in a
-project that uses Batteries without Mathlib a `lemma`'s whole proof was emitted into its minimal file
-instead of `sorry`. Both callers now consult `theoremSyntaxKinds`.
+The extraction re-parses each source file against the already-loaded environment, and decides from
+a command's syntax whether it is a theorem whose proof is replaced by `sorry`. The keyword a
+declaration was written with cannot be recovered from the compiled environment: Mathlib's `lemma`
+is a macro that rewrites itself to `theorem` before elaboration.
 -/
 
 open Lean
@@ -40,19 +30,10 @@ and takes priority over the Batteries one, which it exists to override — but a
 either, so both count. -/
 def lemmaSyntaxKinds : Array SyntaxNodeKind := #[`lemma, `Batteries.Tactic.Lemma.lemmaCmd]
 
-/-- Command kinds meaning "written with `theorem`", the plain keyword and every `lemma` synonym.
-
-This is the "has a proof that may be replaced by `sorry`" test, which is why it includes `lemma`:
-the distinction between the two is editorial, and matters only to what the site *labels* them. -/
+/-- Command kinds meaning "written with `theorem`", the plain keyword and every `lemma` synonym:
+the "has a proof that is replaced by `sorry`" test. -/
 def theoremSyntaxKinds : Array SyntaxNodeKind :=
   #[``Lean.Parser.Command.theorem] ++ lemmaSyntaxKinds
-
-/-- Command kinds meaning "written with `instance`". -/
-def instanceSyntaxKinds : Array SyntaxNodeKind := #[``Lean.Parser.Command.instance]
-
-/-- Command kinds meaning "written with `alias`", both the plain and the `⟨fwd, rev⟩` forms. -/
-def aliasSyntaxKinds : Array SyntaxNodeKind :=
-  #[`Batteries.Tactic.Alias.alias, `Batteries.Tactic.Alias.aliasLR]
 
 /-- Command kinds declaring a `structure` or a `class`; both parse as `Command.structure`, differing
 only in whether they begin with `structureTk` or `classTk`. -/

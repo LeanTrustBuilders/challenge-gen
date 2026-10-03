@@ -1,0 +1,28 @@
+module
+
+@[expose] public section
+
+/-! A structure, a class, and definitions with proofs and tactics in them, in a module. -/
+
+set_option autoImplicit false
+
+namespace Fixture
+
+universe u
+
+structure Box (α : Type u) where
+  val : α
+  size : Nat := by exact 0
+
+def Positive : Type := { n : Nat // 0 < n }
+
+def one : Positive := ⟨1, by decide⟩
+
+def two : Nat := by exact 2
+
+class HasZero' (α : Type u) where
+  zero : α
+
+instance : HasZero' Nat := ⟨0⟩
+
+end Fixture
