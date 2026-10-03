@@ -316,6 +316,25 @@ def isContextCmd (stx : Syntax) : Bool :=
 def slice (source : String) (s e : String.Pos.Raw) : String :=
   ({ str := source, startPos := s, stopPos := e } : Substring.Raw).toString
 
+/-- For an `instance` written without a name, the edit inserting the name the project gave it.
+
+Lean names such an instance after its type, and the name depends on where it is elaborated: in a
+package it may carry a suffix (`instFoo_myPackage`), and in an extracted file it would get another
+name. A challenge is known by its name, so the file writes it out. `names` are the declarations the
+command defines; the instance among them is named by its last component, in the namespace the
+command sits in, as Lean placed it. -/
+def instanceNameEdit? (env : Environment) (stx : Syntax) (names : Array Name) :
+    Option (String.Pos.Raw × String.Pos.Raw × String) := do
+  let inst ← findFirstOfKind? stx ``Parser.Command.instance
+  -- `attrKind "instance" optNamedPrio (declId)? declSig declVal`
+  guard (inst.getNumArgs ≥ 5 && inst[3].getNumArgs == 0)
+  let some n := names.find? (Meta.isInstanceCore env ·) | none
+  let last ← match privateToUserName n with
+    | .str _ s => some s
+    | _ => none
+  let pos ← inst[4].getPos?
+  pure (pos, pos, s!"{Name.mkSimple last} ")
+
 /-- The first identifier in `stx`, depth first. -/
 partial def findFirstIdent? (stx : Syntax) : Option Syntax :=
   if stx.isIdent then some stx else stx.getArgs.findSome? findFirstIdent?
@@ -692,6 +711,7 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- naming an option the extracted file's imports no longer register (see `excludedOptions`).
       let prefixEdits :=
         attributeStripEdits source stx (isStructureDecl stx) ++ setOptionStripEdits stx
+          ++ (instanceNameEdit? env stx names).toArray
       -- Renders the command from `start`, which is either the command's own start or — for a
       -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
       -- `pruneOmit` can re-render the prefix per target. Edits before `start` are irrelevant to

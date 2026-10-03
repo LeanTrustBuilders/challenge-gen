@@ -64,7 +64,7 @@ check("def pred' (n : Nat) : Nat := n - 1" in claim, "pred'_lt: pred' is inlined
 check("helper" not in claim, "pred'_lt: a lemma its proof calls is inlined")
 check(not claim.lstrip().startswith("import"), "pred'_lt: imports, with nothing outside Lean core")
 
-check("instance : IsSmall 3" in read("Fixture.smallVal_three"),
+check("instance instIsSmallOfNatNat : IsSmall 3" in read("Fixture.smallVal_three"),
       "smallVal_three: the instance its statement needs, a proof, is missing")
 
 check("⟨1, sorry⟩" in read("Fixture.one"), "one: an embedded proof is kept")
@@ -104,11 +104,14 @@ check("include b" not in read("Fixture.Inc.early") and "Big" not in read("Fixtur
       "early: an include naming a binder left out is kept")
 
 check("open Nat (succ)" in read("Fixture.three"), "three: an open of a name from outside the project is dropped")
-check("instance : IsPositive three := sorry" in read("Fixture.instIsPositiveThree"),
+check("instance instIsPositiveThree : IsPositive three := sorry" in read("Fixture.instIsPositiveThree"),
       "instIsPositiveThree: an instance of a Prop-valued class keeps its proof")
 
 check("def earlyId (ℵ : Nat) : Nat := ℵ" in (out / "earlyId.lean").read_text(),
       "earlyId: a module parsed with syntax it does not import is cut")
+
+check("instance instIsPositiveOfNat : Fixture.IsPositive 1" in read("Nat.instIsPositiveOfNat"),
+      "Nat.instIsPositiveOfNat: an unnamed instance is not written with the project's name")
 
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")

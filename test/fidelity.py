@@ -7,7 +7,9 @@ For each `<target>.lean` in FILES_DIR (as challenge-gen names them), compiles a 
 printing the target's elaborated type, under PROJECT_DIR's `lake env`, and compares that type with
 the one printed in a file importing ROOT_MODULE (both also import `Lean`, for the probe). Types are
 printed with `pp.all`: every argument and universe explicit, no notation, and hygienic binders
-numbered by position, so neither notation, `open`s nor binder names play a part. Private targets are
+numbered by position, so neither notation, `open`s nor binder names play a part. Proofs inside a
+type are erased first: one statement may elaborate a proof in place where the other abstracted it
+into an auxiliary lemma, and by proof irrelevance they state the same. Private targets are
 skipped. Writes WORK_DIR/fidelity.txt and prints a count of `same`, `DIFFERS`, `fail` (does not
 compile) and `no-project` (not found in the project); exits with 1 if any file differs or fails.
 """
@@ -38,7 +40,9 @@ def probe(key, name):
     return ("\nopen Lean Meta in\n#eval show MetaM Unit from do\n"
             f"  let n := (Syntax.decodeNameLit {literal}).getD .anonymous\n"
             "  let t ← try some <$> (do\n"
-            "      let f ← withOptions (·.setBool `pp.all true) (ppExpr (← getConstInfo n).type)\n"
+            "      let e ← Meta.transform (← getConstInfo n).type (pre := fun e => do\n"
+            "        if (← Meta.isProof e) then return .done (mkConst `proof) else return .continue)\n"
+            "      let f ← withOptions (·.setBool `pp.all true) (ppExpr e)\n"
             "      pure (f.pretty 100000)) catch _ => pure none\n"
             f"  IO.println s!\"@@@{key}@@@{{t.getD \"MISSING\"}}@@@END\"\n")
 

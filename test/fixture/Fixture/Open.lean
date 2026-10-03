@@ -19,3 +19,10 @@ instance : IsPositive three where
   pos := by simp [unused_lemma, three]
 
 end Fixture
+
+namespace Nat
+
+/-- An unnamed instance in a namespace of another package: Lean gives it a suffixed name. -/
+instance : Fixture.IsPositive 1 := ⟨Nat.one_pos⟩
+
+end Nat
