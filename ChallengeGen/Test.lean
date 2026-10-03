@@ -45,7 +45,7 @@ namespace ChallengeGen.Test
 
 /-! ## `binderTypeHead?`
 
-The head symbol of a binder's *type*, used by `pruneVariable` to resolve generalized field
+The head symbol of a binder's *type*, used by `entryKept` to resolve generalized field
 notation (`𝓕.IsComplete` ⇒ `Filtration.IsComplete`) back to the declaration it references. -/
 
 #guard binderTypeHead? "{𝓕 : Filtration ι mΩ}" == some `Filtration
@@ -56,7 +56,7 @@ notation (`𝓕.IsComplete` ⇒ `Filtration.IsComplete`) back to the declaration
 -- No `:` separator, so there is no type to read.
 #guard binderTypeHead? "[TopologicalSpace β]" == none
 #guard binderTypeHead? "{α β}" == none
--- A function type reports the head of its *first* argument; `pruneVariable` only ever uses this to
+-- A function type reports the head of its *first* argument; `entryKept` only ever uses this to
 -- look up an exact excluded name, so an imprecise head simply fails to match and drops nothing.
 #guard binderTypeHead? "{X : ι → Ω → E}" == some `ι
 
@@ -359,6 +359,26 @@ are the ones whose loss makes *other* declarations fail to elaborate. -/
 #guard (collectSyntaxKinds (.node .none `A.b #[.node .none `C.d #[]])).contains `A.b
 #guard (collectSyntaxKinds (.node .none `A.b #[.node .none `C.d #[]])).contains `C.d
 #guard !(collectSyntaxKinds (.node .none `A.b #[])).contains `X.y
+
+/-! ## Quotations
+
+A quotation holds code a macro builds: a `theorem` quoted in a `macro` does not make it a theorem,
+and the `:=` value found in a command is never one inside a quotation. -/
+
+private def quotedTheorem : Syntax :=
+  .node .none `Lean.Parser.Command.macro #[
+    .node .none ``Lean.Parser.Term.quot #[
+      .node .none ``Lean.Parser.Command.declaration #[
+        .node .none ``Lean.Parser.Command.theorem #[
+          .node .none ``Lean.Parser.Command.declValSimple #[]]]]]
+
+#guard !isTheoremDecl quotedTheorem
+#guard (findDeclValStx? quotedTheorem).isNone
+-- The same theorem, unquoted, is one.
+#guard isTheoremDecl (.node .none ``Lean.Parser.Command.declaration #[
+    .node .none ``Lean.Parser.Command.theorem #[]])
+-- Notation uses inside a quotation still count: its text is parsed with them.
+#guard (collectSyntaxKinds quotedTheorem).contains ``Lean.Parser.Command.theorem
 
 /-! ## `collectIdents` -/
 

@@ -104,7 +104,7 @@ structure CommandEntry where
   signal is the only way to know the verbatim source needs that notation command replayed. -/
   usedNotations : Array Name := #[]
   /-- For a declaration wrapped in `omit … in`, the omitted binders as `(source text, identifiers)`.
-  These name `variable` binders, so they must be pruned in step with them: `pruneVariable` drops a
+  These name `variable` binders, so they must be pruned in step with them: `entryKept` drops a
   binder referencing a declaration outside the target's closure, and an `omit` still naming it would
   then be an undefined reference. Empty for every other command. -/
   omitBinders : Array (String × Array String) := #[]
@@ -171,8 +171,9 @@ partial def findDeclValStx? (root : Syntax) : Option Syntax := Id.run do
     if k == ``Parser.Command.declValSimple || k == ``Parser.Command.declValEqns
         || k == ``Parser.Command.whereStructInst then
       return some stx
-    for arg in stx.getArgs do
-      worklist := worklist.push arg
+    unless isQuotation stx do
+      for arg in stx.getArgs do
+        worklist := worklist.push arg
   return none
 
 /-- The byte range of the *value*/proof part of a declaration, if present. -/
@@ -205,7 +206,7 @@ partial def collectByBlocks (root : Syntax) : Array (String.Pos.Raw × String.Po
       match stx.getPos?, stx.getTailPos? with
       | some s, some e => acc := acc.push (s, e)   -- don't descend into a block we'll replace
       | _, _ => for arg in stx.getArgs do worklist := worklist.push arg
-    else
+    else if !isQuotation stx then
       for arg in stx.getArgs do
         worklist := worklist.push arg
   return acc
@@ -243,8 +244,9 @@ partial def wholeValueTacticRanges (root : Syntax) : Array (String.Pos.Raw × St
           match a.getPos?, a.getTailPos? with
           | some s, some e => acc := acc.push (s, e)
           | _, _ => pure ()
-    for a in stx.getArgs do
-      worklist := worklist.push a
+    unless isQuotation stx do
+      for a in stx.getArgs do
+        worklist := worklist.push a
   return acc
 
 /-- The byte ranges of the `binderTactic` nodes inside `root`, i.e. binder/field defaults written
@@ -265,13 +267,14 @@ partial def collectBinderTactics (root : Syntax) : Array (String.Pos.Raw × Stri
       match stx.getPos?, stx.getTailPos? with
       | some s, some e => acc := acc.push (s, e)   -- don't descend into a block we'll replace
       | _, _ => for arg in stx.getArgs do worklist := worklist.push arg
-    else
+    else if !isQuotation stx then
       for arg in stx.getArgs do
         worklist := worklist.push arg
   return acc
 
 /-- Every `SyntaxNodeKind` occurring anywhere in `stx` (including `stx` itself). A notation use shows
-up here as a node whose kind is the notation parser's name. -/
+up here as a node whose kind is the notation parser's name. Quotations are entered, unlike in the
+other walks: a quotation's text is parsed with the notations it uses. -/
 partial def collectSyntaxKinds (stx : Syntax) : Std.HashSet Name := Id.run do
   let mut acc : Std.HashSet Name := {}
   let mut worklist : Array Syntax := #[stx]
@@ -296,6 +299,9 @@ def isContextCmd (stx : Syntax) : Bool :=
   k == ``Parser.Command.namespace || k == ``Parser.Command.«end» || k == ``Parser.Command.«open»
     || k == ``Parser.Command.«variable» || k == ``Parser.Command.«section»
     || k == ``Parser.Command.«set_option» || k == ``Parser.Command.«universe»
+    -- `include x` adds the variable `x` to every theorem after it, and `omit` takes one out: lost,
+    -- either changes the statements that follow.
+    || k == ``Parser.Command.«include» || k == ``Parser.Command.«omit»
     -- A standalone `attribute [...] X` is a *side effect* on `X` rather than a declaration, so
     -- dropping it silently loses whatever it registered. Classified as context here so it can be
     -- considered; `assembleTarget` then replays only the ones carrying a `translationAttributes`
@@ -351,7 +357,7 @@ def derivingReplacement? (source : String) (stx : Syntax) (cmdEnd : String.Pos.R
       let s := wl.back!; wl := wl.pop
       match s with
       | .atom _ "deriving" => return some s
-      | _ => for a in s.getArgs do wl := wl.push a
+      | _ => unless isQuotation s do for a in s.getArgs do wl := wl.push a
     return none) | return none
   let some dpos := derivingAtom.getPos? | return none
   let some dtail := derivingAtom.getTailPos? | return none
@@ -539,7 +545,7 @@ partial def attributeStripEdits (source : String) (root : Syntax) (onStructure :
           else
             acc := acc.push (s, e, "@[" ++ ", ".intercalate kept.toList ++ "]")
       | _, _ => pure ()
-    else
+    else if !isQuotation stx then
       for a in stx.getArgs do
         worklist := worklist.push a
   return acc
@@ -564,8 +570,9 @@ partial def setOptionStripEdits (root : Syntax) :
       match stx.getPos?, stx[1].getTailPos? with
       | some s, some e => acc := acc.push (s, e, "")
       | _, _ => pure ()
-    for a in stx.getArgs do
-      worklist := worklist.push a
+    unless isQuotation stx do
+      for a in stx.getArgs do
+        worklist := worklist.push a
   return acc
 
 /-- Attributes that register a *translation* between a declaration and its multiplicative/additive
@@ -627,11 +634,11 @@ def decomposeOmit? (source : String) (stx : Syntax) :
 /-! ## Phase 1: process one source file -/
 
 /-- Re-elaborates `source` against `env` (`parseCommands`) and classifies every command. `declPos`
-maps the byte index of each exposed declaration's range start to its name (so a command is a
+maps the byte index where exposed declarations' ranges start to their names (so a command is a
 declaration command iff some such position falls inside it). `notationKinds` maps the syntax kind of
 each exposed notation, read without the prefix of a private name, to its declaration. -/
 def processFile (env : Environment) (source : String) (filePath : String)
-    (declPos : Std.HashMap Nat Name) (notationKinds : Std.HashMap Name Name) :
+    (declPos : Std.HashMap Nat (Array Name)) (notationKinds : Std.HashMap Name Name) :
     IO (Array CommandEntry) := do
   let commands ← parseCommands env source filePath
   let mut entries : Array CommandEntry := #[]
@@ -656,9 +663,9 @@ def processFile (env : Environment) (source : String) (filePath : String)
     let some cmdEnd := stx.getTailPos? | continue
     -- Which exposed declarations does this command define?
     let mut names : Array Name := #[]
-    for (pos, name) in declPos do
+    for (pos, declared) in declPos do
       if pos ≥ cmdStart.byteIdx && pos < cmdEnd.byteIdx then
-        names := names.push name
+        names := names ++ declared
     if !names.isEmpty then
       -- Theorems/lemmas: replace the whole proof with `sorry`. Definitions: keep the value verbatim
       -- but replace any embedded `by …` tactic proofs in it with `sorry`, and turn a `deriving`
@@ -741,7 +748,8 @@ def processFile (env : Environment) (source : String) (filePath : String)
           | none => "end"
       else if kind == ``Parser.Command.«end» then
         closers := closers.pop
-      let binders := if kind == ``Parser.Command.«variable» then
+      let binders := if kind == ``Parser.Command.«variable» || kind == ``Parser.Command.«include»
+          || kind == ``Parser.Command.«omit» then
         decomposeVariable source stx else #[]
       -- `openOnly` is `open NS (a b c)`, parsed as 4 children: the `NS` ident, the `(` token, a
       -- node wrapping the `a b c` idents, and the `)` token. Reading `NS` and the list from their
@@ -899,35 +907,41 @@ def binderRefsExcluded (env : Environment) (rootPrefix : Name) (excludedNames : 
   else
     resolvesToExcluded n || fieldNotationExcluded n
 
-@[inherit_doc binderRefsExcluded]
-def pruneVariable (env : Environment) (rootPrefix : Name) (excludedNames : Std.HashSet Name)
+/-- Whether an entry of a `variable`, `include` or `omit` command survives in a file. A binder
+survives unless one of its identifiers names a declaration left out of the file
+(`binderRefsExcluded`). A bare variable name, as `include` and `omit` take, survives only if a
+binder of that name did (`bound`): `include hf` after the binder `(hf : P f)` was dropped would
+name no variable. -/
+def entryKept (env : Environment) (rootPrefix : Name) (excludedNames : Std.HashSet Name)
     (activePrefixes : Array Name) (boundVars : Std.HashSet Name)
-    (boundVarTypes : Std.HashMap Name Name) (e : CommandEntry) : Option String :=
+    (boundVarTypes : Std.HashMap Name Name) (bound : Std.HashSet Name)
+    (entry : String × Array String) : Bool :=
+  let (src, idents) := entry
+  if idents.size == 1 && src.trimAscii.toString == idents[0]! then
+    bound.contains idents[0]!.toName
+  else
+    !idents.any (binderRefsExcluded env rootPrefix excludedNames activePrefixes boundVars
+      boundVarTypes)
+
+/-- Renders a `variable`, `include` or `omit` command with the entries that survive (`entryKept`),
+or `none` when none does. A command that could not be decomposed is kept verbatim. -/
+def pruneEntries (keep : String × Array String → Bool) (keyword : String) (e : CommandEntry) :
+    Option String :=
   if e.binders.isEmpty then
     some e.src   -- couldn't decompose; keep verbatim
   else
-    let kept := e.binders.filter fun (_, idents) =>
-      !idents.any (binderRefsExcluded env rootPrefix excludedNames activePrefixes boundVars
-        boundVarTypes)
+    let kept := e.binders.filter keep
     if kept.isEmpty then none
-    else some ("variable " ++ " ".intercalate (kept.map (·.1)).toList)
+    else some (keyword ++ " " ++ " ".intercalate (kept.map (·.1)).toList)
 
-/-- Renders a declaration command, pruning any `omit … in` prefix in step with `pruneVariable`.
-
-`omit` names `variable` binders, so whenever a binder is dropped because it references a
-declaration outside this target's closure, an `omit` still naming it becomes an undefined
-reference (`unknown identifier`). The surviving entries are re-rendered, or the whole prefix is
-dropped when none survive. Uses the same predicate as `pruneVariable`, so it sees generalized
-field notation (`[𝓕.IsRightContinuous]`) the same way. -/
-def pruneOmit (env : Environment) (rootPrefix : Name) (excludedNames : Std.HashSet Name)
-    (activePrefixes : Array Name) (boundVars : Std.HashSet Name)
-    (boundVarTypes : Std.HashMap Name Name) (e : CommandEntry) : String :=
+/-- Renders a declaration command, pruning any `omit … in` prefix in step with the `variable`
+binders (`entryKept`): an `omit` still naming a binder that was dropped is an undefined reference.
+The surviving entries are re-rendered, or the whole prefix is dropped when none survive. -/
+def pruneOmit (keep : String × Array String → Bool) (e : CommandEntry) : String :=
   match e.srcNoOmit? with
   | none => e.src
   | some bare =>
-    let kept := e.omitBinders.filter fun (_, idents) =>
-      !idents.any (binderRefsExcluded env rootPrefix excludedNames activePrefixes boundVars
-        boundVarTypes)
+    let kept := e.omitBinders.filter keep
     if kept.size == e.omitBinders.size then e.src
     else if kept.isEmpty then bare
     else "omit " ++ " ".intercalate (kept.map (·.1)).toList ++ " in\n" ++ bare
@@ -1212,7 +1226,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- options are unknown (no `.setup.json`) is left out of the comparison.
   let common := commonOptions (involved.filterMap fun (m, _) => moduleOptions.get? m)
   -- Exposed declarations *not* emitted in this file: a `variable` binder referencing one of these
-  -- would reference an undefined name, so such binders are dropped (see `pruneVariable`).
+  -- would reference an undefined name, so such binders are dropped (see `entryKept`).
   -- A private declaration is referred to by its name without the private prefix.
   let excludedNames : Std.HashSet Name := exposedNames.fold (init := {}) fun s n =>
     if keep.contains n then s else (s.insert n).insert (privateToUserName n)
@@ -1229,7 +1243,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     return s
   -- The head symbol of each bound name's type (`𝓕 ↦ Filtration`), so that generalized field
   -- notation written on it (`𝓕.IsComplete`) can be resolved back to the declaration it names.
-  -- See `pruneVariable`.
+  -- See `entryKept`.
   let boundVarTypes : Std.HashMap Name Name := Id.run do
     let mut m : Std.HashMap Name Name := {}
     for (_, entries) in involved do
@@ -1259,8 +1273,10 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   let mut items : Array OutChunk := #[]
   -- Namespace prefixes in scope when resolving `variable` binder identifiers: the root plus every
   -- entered (`namespace`) or opened (`open`) namespace. Accumulated (never popped) as an
-  -- over-approximation of scope; `pruneVariable` only matches exact excluded names against it.
+  -- over-approximation of scope; `entryKept` only matches exact excluded names against it.
   let mut activePrefixes : Array Name := #[Name.anonymous]
+  -- The names bound by the `variable` binders kept so far, which `include` and `omit` may name.
+  let mut bound : Std.HashSet Name := {}
   for (modName, entries) in involved do
     -- The module's path below the root (`Foo.Bar` under root `Foo` reads as `Bar`), except for the
     -- root module itself, whose path below the root is empty.
@@ -1285,9 +1301,17 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for e in entries do
       match e.cls with
       | .context =>
+        let entryOk := entryKept env rootPrefix excludedNames activePrefixes boundVars boundVarTypes bound
         if e.kind == ``Parser.Command.«variable» then
-          if let some v := pruneVariable env rootPrefix excludedNames activePrefixes boundVars
-              boundVarTypes e then
+          for (bsrc, idents) in e.binders do
+            if entryOk (bsrc, idents) then
+              bound := (binderBoundNames bsrc).foldl (·.insert ·.toName) bound
+          if let some v := pruneEntries entryOk "variable" e then
+            items := items.push { tag := .soft, text := v ++ "\n" }
+        else if e.kind == ``Parser.Command.«include» || e.kind == ``Parser.Command.«omit» then
+          -- Scoped like `variable`, and pruned in step with it.
+          let keyword := if e.kind == ``Parser.Command.«include» then "include" else "omit"
+          if let some v := pruneEntries entryOk keyword e then
             items := items.push { tag := .soft, text := v ++ "\n" }
         else if e.kind == ``Parser.Command.namespace then
           if let some ns := e.nsName? then
@@ -1306,7 +1330,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
         else if e.kind == ``Parser.Command.«attribute» then
           -- Replayed only for translation attributes (see `translationAttributes`), and only when
           -- every name it targets actually exists here. The target test is stricter than
-          -- `pruneVariable`'s: it rejects any project-local constant outside `keep`, not just an
+          -- `entryKept`'s: it rejects any project-local constant outside `keep`, not just an
           -- *exposed* one, since a non-exposed project declaration is never emitted either.
           -- `.hard`, not `.soft`: the registration is real content, and the enclosing
           -- `namespace`/`open` scope is what makes its target resolve.
@@ -1343,7 +1367,8 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
         else
           items := items.push { tag := .hard, text := e.src ++ "\n" }
       | .decl =>
-        let body := pruneOmit env rootPrefix excludedNames activePrefixes boundVars boundVarTypes e
+        let body := pruneOmit
+          (entryKept env rootPrefix excludedNames activePrefixes boundVars boundVarTypes bound) e
         let mut s := "\n" ++ body ++ "\n"
         for extra in e.appended do
           s := s ++ extra ++ "\n"
@@ -1392,15 +1417,17 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
 
 /-! ## Driver -/
 
-/-- Computes the byte index (in `source`) of the start of each declaration's range, for the
-declarations in `modDecls`. -/
+/-- The declarations of `modDecls` by the byte index (in `source`) where their range starts. Several
+can start at one position: a command declaring more than one constant may give them all its own
+range, as Mathlib's `irreducible_def` does for `foo` and `foo_def`. -/
 def declPositions (env : Environment) (source : String) (modDecls : Array Name) :
-    IO (Std.HashMap Nat Name) := do
+    IO (Std.HashMap Nat (Array Name)) := do
   let fileMap := FileMap.ofString source
-  let mut m : Std.HashMap Nat Name := {}
+  let mut m : Std.HashMap Nat (Array Name) := {}
   for name in modDecls do
     if let some ranges ← findRanges? env name then
-      m := m.insert (fileMap.ofPosition ranges.range.pos).byteIdx name
+      let pos := (fileMap.ofPosition ranges.range.pos).byteIdx
+      m := m.insert pos ((m.getD pos #[]).push name)
   return m
 
 /-- What the emitted text of each of `names` needs, from `MeaningGraph`, in the order of `names`.

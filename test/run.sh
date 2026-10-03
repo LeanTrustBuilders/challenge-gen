@@ -96,6 +96,13 @@ check("variable (g : (Nat → Nat))" in app_eq, "Pair.app_eq: a binder holding p
 check(app_eq.count("set_option autoImplicit false") == 1,
       "Pair.app_eq: its source's setting of an option already set at the top is kept")
 
+check("def_with_eq seven : Nat := 7" in read("Fixture.seven_pos"),
+      "seven_pos: a command declaring two constants at one position is lost")
+
+check("include hn" in read("Fixture.Inc.pos_succ"), "pos_succ: its include is not replayed")
+check("include b" not in read("Fixture.Inc.early") and "Big" not in read("Fixture.Inc.early"),
+      "early: an include naming a binder left out is kept")
+
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
 print("ok: proofs, values, annotations, notation, sections, binders, options and closures")

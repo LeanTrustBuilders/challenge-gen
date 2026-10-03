@@ -39,14 +39,25 @@ def theoremSyntaxKinds : Array SyntaxNodeKind :=
 only in whether they begin with `structureTk` or `classTk`. -/
 def structureSyntaxKinds : Array SyntaxNodeKind := #[``Lean.Parser.Command.structure]
 
+/-- Syntax quotations, `` `(…) `` in all its forms. What a quotation holds is code a macro builds,
+not the structure of the command it sits in: a `theorem` quoted in a `macro` does not make the
+`macro` a theorem, and a `by` quoted in it is no proof. -/
+def quotationKinds : Array SyntaxNodeKind :=
+  #[``Lean.Parser.Term.quot, ``Lean.Parser.Term.precheckedQuot, ``Lean.Parser.Command.quot,
+    ``Lean.Parser.Term.dynamicQuot, ``Lean.Parser.Tactic.quot, ``Lean.Parser.Tactic.quotSeq]
+
+@[inherit_doc quotationKinds]
+def isQuotation (stx : Syntax) : Bool := quotationKinds.contains stx.getKind
+
 /-! ## Searching a command's syntax -/
 
-/-- The first descendant of `root` whose kind is one of `kinds`, breadth-first.
+/-- The first descendant of `root` whose kind is one of `kinds`, outside quotations.
 
 Searching the whole tree rather than only the head is what sees through the wrapper commands a
 declaration can be nested in — `set_option … in`, `open … in`, `omit … in`. It stays specific
-despite that: a declaration keyword is a *command* node, and no term ever contains one, so a `def`'s
-syntax cannot match `theoremSyntaxKinds`. -/
+despite that: a declaration keyword is a *command* node, which no term contains except a quotation,
+and quotations are not entered (`quotationKinds`), so a `def`'s or a `macro`'s syntax cannot match
+`theoremSyntaxKinds`. -/
 partial def findFirstOfKinds? (root : Syntax) (kinds : Array SyntaxNodeKind) : Option Syntax :=
   Id.run do
   let mut worklist : Array Syntax := #[root]
@@ -54,8 +65,9 @@ partial def findFirstOfKinds? (root : Syntax) (kinds : Array SyntaxNodeKind) : O
     let stx := worklist.back!
     worklist := worklist.pop
     if kinds.contains stx.getKind then return some stx
-    for arg in stx.getArgs do
-      worklist := worklist.push arg
+    unless isQuotation stx do
+      for arg in stx.getArgs do
+        worklist := worklist.push arg
   return none
 
 @[inherit_doc findFirstOfKinds?]
