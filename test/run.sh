@@ -73,7 +73,7 @@ box = read("Fixture.Box")
 check("by exact 0" not in box and "size : Nat := sorry" in box,
       "Box: a field's tactic default is kept")
 code = read("Fixture.Uses.Code")
-check("deriving" not in code and "instance : BEq (Code) := sorry" in code,
+check("deriving" not in code and "instance instBEqCode : BEq (Code) := sorry" in code,
       "Code: the deriving clause is not replaced by an instance")
 
 quad = read("Fixture.Uses.quad")
@@ -112,6 +112,11 @@ check("def earlyId (ℵ : Nat) : Nat := ℵ" in (out / "earlyId.lean").read_text
 
 check("instance instIsPositiveOfNat : Fixture.IsPositive 1" in read("Nat.instIsPositiveOfNat"),
       "Nat.instIsPositiveOfNat: an unnamed instance is not written with the project's name")
+
+check("instance Wrap.instBEqNum : BEq (Wrap.Num) := sorry" in read("Fixture.Wrap.instBEqNum"),
+      "Wrap.instBEqNum: a derived instance is not written with the project's name")
+check("structure Sized (n : Nat := by exact 3)" in read("Fixture.Sized"),
+      "Sized: a parameter's tactic default, part of the structure's type, is replaced")
 
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")

@@ -316,24 +316,37 @@ def isContextCmd (stx : Syntax) : Bool :=
 def slice (source : String) (s e : String.Pos.Raw) : String :=
   ({ str := source, startPos := s, stopPos := e } : Substring.Raw).toString
 
+/-- How to write the name of a declaration `n` where the current namespace is `ns`: relative to `ns`
+when `n` lies under it, from the root (`_root_.`) otherwise. A private name is written as its author
+wrote it. -/
+def nameAt (ns n : Name) : String :=
+  let n := privateToUserName n
+  if ns.isAnonymous then n.toString
+  else if ns.isPrefixOf n && n != ns then (n.replacePrefix ns .anonymous).toString
+  else "_root_." ++ n.toString
+
+/-- The instance among `names` whose class is `cls`, as written after `deriving`: matched on the last
+component of the class at the head of its type. -/
+def derivedInstance? (env : Environment) (names : Array Name) (cls : String) : Option Name :=
+  let last := (cls.trimAscii.toString.toName).getString!
+  names.find? fun n =>
+    Meta.isInstanceCore env n &&
+      ((env.find? n).bind (·.type.getForallBody.getAppFn.constName?)).any (·.getString! == last)
+
 /-- For an `instance` written without a name, the edit inserting the name the project gave it.
 
 Lean names such an instance after its type, and the name depends on where it is elaborated: in a
 package it may carry a suffix (`instFoo_myPackage`), and in an extracted file it would get another
 name. A challenge is known by its name, so the file writes it out. `names` are the declarations the
-command defines; the instance among them is named by its last component, in the namespace the
-command sits in, as Lean placed it. -/
-def instanceNameEdit? (env : Environment) (stx : Syntax) (names : Array Name) :
+command defines; `ns` is the namespace the command sits in (`nameAt`). -/
+def instanceNameEdit? (env : Environment) (ns : Name) (stx : Syntax) (names : Array Name) :
     Option (String.Pos.Raw × String.Pos.Raw × String) := do
   let inst ← findFirstOfKind? stx ``Parser.Command.instance
   -- `attrKind "instance" optNamedPrio (declId)? declSig declVal`
   guard (inst.getNumArgs ≥ 5 && inst[3].getNumArgs == 0)
   let some n := names.find? (Meta.isInstanceCore env ·) | none
-  let last ← match privateToUserName n with
-    | .str _ s => some s
-    | _ => none
   let pos ← inst[4].getPos?
-  pure (pos, pos, s!"{Name.mkSimple last} ")
+  pure (pos, pos, s!"{nameAt ns n} ")
 
 /-- The first identifier in `stx`, depth first. -/
 partial def findFirstIdent? (stx : Syntax) : Option Syntax :=
@@ -372,8 +385,8 @@ def applyEdits (source : String) (cmdStart cmdEnd : String.Pos.Raw)
 the byte position where the `deriving` keyword starts (everything from here is dropped), and the
 generated `instance … := sorry` commands (one per derived class). Returns `none` if the command has
 no `deriving` clause or its shape can't be reconstructed (in which case it is left verbatim). -/
-def derivingReplacement? (source : String) (stx : Syntax) (cmdEnd : String.Pos.Raw) :
-    Option (String.Pos.Raw × Array String) := Id.run do
+def derivingReplacement? (source : String) (stx : Syntax) (cmdEnd : String.Pos.Raw)
+    (nameOf : String → String := fun _ => "") : Option (String.Pos.Raw × Array String) := Id.run do
   -- Only `def` deriving causes the delta-derivation failures; structures derive fine.
   let some defNode := findFirstOfKind? stx ``Parser.Command.definition | return none
   -- The `deriving` keyword atom inside the definition.
@@ -417,7 +430,11 @@ def derivingReplacement? (source : String) (stx : Syntax) (cmdEnd : String.Pos.R
     | _, _ => return none
   let app := " ".intercalate (defName :: applyNames.toList)
   let bindersClause := if bindersText.isEmpty then "" else " " ++ bindersText
-  let instances := classes.map fun c => s!"instance{bindersClause} : {c} ({app}) := sorry"
+  -- Each instance is named as the deriving handler named it (`nameOf`), since Lean would name an
+  -- unnamed one otherwise.
+  let instances := classes.map fun c =>
+    let name := nameOf c
+    s!"instance{if name.isEmpty then "" else " " ++ name}{bindersClause} : {c} ({app}) := sorry"
   return some (dpos, instances.toArray)
 
 /-- Every identifier appearing anywhere in `stx`, as strings.
@@ -703,7 +720,8 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- into standalone `instance … := sorry` (it can't be delta-derived in the minimal file).
       let (declEnd, appended) :=
         if isProof then (cmdEnd, #[])
-        else match derivingReplacement? source stx cmdEnd with
+        else match derivingReplacement? source stx cmdEnd fun c =>
+            (derivedInstance? env names c).map (nameAt nsPrefixStack.back!) |>.getD "" with
           | some (dpos, instances) => (dpos, instances)
           | none => (cmdEnd, #[])
       -- Attributes whose elaboration reaches outside this file are dropped from every declaration
@@ -711,7 +729,7 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- naming an option the extracted file's imports no longer register (see `excludedOptions`).
       let prefixEdits :=
         attributeStripEdits source stx (isStructureDecl stx) ++ setOptionStripEdits stx
-          ++ (instanceNameEdit? env stx names).toArray
+          ++ (instanceNameEdit? env nsPrefixStack.back! stx names).toArray
       -- Renders the command from `start`, which is either the command's own start or — for a
       -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
       -- `pruneOmit` can re-render the prefix per target. Edits before `start` are irrelevant to
@@ -734,7 +752,11 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
               -- construction of the structure that omits the field fails with "could not
               -- synthesize default value for field". `binderTactic` spans its own ` := by `, so
               -- the replacement has to restore the `:=`.
-              (collectBinderTactics stx).map fun (bs, be) => (bs, be, ":= sorry")
+              -- Only in the fields: a `:= by tac` default among the structure's parameters is
+              -- an `autoParam` of its type, which `sorry` would change (`IsBrownianReal X` would
+              -- mean "for the measure `sorry`").
+              ((findFirstOfKind? stx ``Parser.Command.structFields).map collectBinderTactics
+                |>.getD #[]).map fun (bs, be) => (bs, be, ":= sorry")
             else
               let byBlocks := match findDeclValStx? stx with
                 | some v => collectByBlocks v

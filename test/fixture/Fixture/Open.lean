@@ -18,6 +18,14 @@ class IsPositive (n : Nat) : Prop where
 instance : IsPositive three where
   pos := by simp [unused_lemma, three]
 
+/-- Derived in the namespace of the definition, `Fixture.Wrap`, not the current one. -/
+def Wrap.Num := Nat
+deriving BEq
+
+/-- A parameter with a tactic default: an `autoParam` in the structure's type. -/
+structure Sized (n : Nat := by exact 3) where
+  val : Fin (n + 1)
+
 end Fixture
 
 namespace Nat
