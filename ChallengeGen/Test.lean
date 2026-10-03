@@ -218,6 +218,28 @@ private def chunkText (cs : Array OutChunk) : String := String.join (cs.toList.m
     { tag := .close, text := "end\n" }]) ==
   "section\nnamespace A\ndef x := 1\nend A\nnamespace B\ndef y := 1\nend B\nend\n"
 
+-- `end A.B` closes two scopes, opened together or apart; what follows is outside both.
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openNamespace, text := "namespace A\n" },
+    { tag := .openNamespace, text := "namespace B\n" },
+    { tag := .hard, text := "def x := 1\n" },
+    { tag := .close, text := "end A.B\n", scopes := 2 },
+    { tag := .hard, text := "def y := 1\n" }]) ==
+  "namespace A\nnamespace B\ndef x := 1\nend A.B\ndef y := 1\n"
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openSection, text := "section\n" },
+    { tag := .openNamespace, text := "namespace A\n" },
+    { tag := .openNamespace, text := "namespace B\n" },
+    { tag := .soft, text := "open C\n" },
+    { tag := .close, text := "end A.B\n", scopes := 2 },
+    { tag := .hard, text := "def y := 1\n" },
+    { tag := .close, text := "end\n" }]) == "section\ndef y := 1\nend\n"
+#guard chunkText (stripEmptyScopes #[
+    { tag := .openNamespace, text := "namespace A.B\n", scopes := 2 },
+    { tag := .hard, text := "def x := 1\n" },
+    { tag := .close, text := "end B\n" },
+    { tag := .close, text := "end A\n" }]) == "namespace A.B\ndef x := 1\nend B\nend A\n"
+
 -- Stubs are read off what survived: the dropped block's namespace is not asked for.
 #guard chunkNamespaces (stripEmptyScopes #[
     { tag := .openNamespace, text := "namespace Gone\n", namespaces := #[`Gone] },

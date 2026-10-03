@@ -60,11 +60,14 @@ structure CommandEntry where
   src : String
   kind : SyntaxNodeKind
   declNames : Array Name := #[]
-  /-- For a declaration command, whether its value is replaced by `sorry`: a theorem with a value.
+  /-- For a declaration command, whether its value is replaced by `sorry`: a proof with a value.
   What it needs is then what its statement needs (see `neededDeps`). -/
   valueDropped : Bool := false
   /-- For a `section` command, the command as replayed (`replayedSection`). -/
   sectionSrc? : Option String := none
+  /-- For a `namespace`, `section` or `end` command, how many scopes it opens or closes: one per
+  component of its name, one for an anonymous `section` or `end`. -/
+  scopes : Nat := 1
   /-- For a `namespace` command, the namespace it opens exactly as spelled in the source (used by
   `activePrefixes` for `variable`-pruning; kept relative/possibly-unqualified on purpose, since
   that pruning logic is unaffected by whether a namespace was entered via its full dotted path or
@@ -312,6 +315,10 @@ def isContextCmd (stx : Syntax) : Bool :=
 /-- The substring of `source` between two byte positions. -/
 def slice (source : String) (s e : String.Pos.Raw) : String :=
   ({ str := source, startPos := s, stopPos := e } : Substring.Raw).toString
+
+/-- The first identifier in `stx`, depth first. -/
+partial def findFirstIdent? (stx : Syntax) : Option Syntax :=
+  if stx.isIdent then some stx else stx.getArgs.findSome? findFirstIdent?
 
 /-- A `section` command as it is replayed: `noncomputable` and the section's name kept, the module
 system's `@[expose]`, `public` and `meta` dropped, since an extracted file is not a module.
@@ -667,11 +674,17 @@ def processFile (env : Environment) (source : String) (filePath : String)
       if pos ≥ cmdStart.byteIdx && pos < cmdEnd.byteIdx then
         names := names ++ declared
     if !names.isEmpty then
-      -- Theorems/lemmas: replace the whole proof with `sorry`. Definitions: keep the value verbatim
-      -- but replace any embedded `by …` tactic proofs in it with `sorry`, and turn a `deriving`
-      -- clause into standalone `instance … := sorry` (it can't be delta-derived in the minimal file).
+      -- A proof: a theorem or lemma, or a command all of whose declarations are theorems, such as an
+      -- `instance` of a `Prop`-valued class. Its value is replaced by `sorry` whole; Lean decides
+      -- which section variables a theorem takes from its statement alone, so this cannot change
+      -- its signature, and no tactic of it has to run in the extracted file.
+      let isProof := isTheoremDecl stx ||
+        names.all fun n => (env.find? n).any (· matches .thmInfo _)
+      -- Proofs: replace the whole value with `sorry`. Definitions: keep the value verbatim but
+      -- replace any embedded `by …` tactic proofs in it with `sorry`, and turn a `deriving` clause
+      -- into standalone `instance … := sorry` (it can't be delta-derived in the minimal file).
       let (declEnd, appended) :=
-        if isTheoremDecl stx then (cmdEnd, #[])
+        if isProof then (cmdEnd, #[])
         else match derivingReplacement? source stx cmdEnd with
           | some (dpos, instances) => (dpos, instances)
           | none => (cmdEnd, #[])
@@ -687,7 +700,7 @@ def processFile (env : Environment) (source : String) (filePath : String)
       let mkSrc (start : String.Pos.Raw) : String :=
         let prefixEdits := prefixEdits.filter fun (r : String.Pos.Raw × String.Pos.Raw × String) =>
           r.1.byteIdx ≥ start.byteIdx
-        if isTheoremDecl stx then
+        if isProof then
           match findDeclVal? stx with
           | some (valStart, _) => applyEdits source start valStart prefixEdits ++ ":= sorry"
           | none => applyEdits source start cmdEnd prefixEdits
@@ -723,7 +736,7 @@ def processFile (env : Environment) (source : String) (filePath : String)
         | none => (#[], none)
       let usedNotations := (collectSyntaxKinds stx).toArray.filterMap fun k =>
         notationKinds.get? (privateToUserName k)
-      let valueDropped := isTheoremDecl stx && (findDeclVal? stx).isSome
+      let valueDropped := isProof && (findDeclVal? stx).isSome
       entries := entries.push
         { cls := .decl, src, kind := stx.getKind, declNames := names, valueDropped, appended,
           usedNotations, omitBinders, srcNoOmit? }
@@ -734,20 +747,28 @@ def processFile (env : Environment) (source : String) (filePath : String)
       let qualifiedNsName? := nsName?.map (nsPrefixStack.back! ++ ·)
       let sectionSrc? := if kind == ``Parser.Command.«section» && stx.getArgs.size ≥ 3 then
         some (replayedSection source stx) else none
-      if let some ns := qualifiedNsName? then
-        nsPrefixStack := nsPrefixStack.push ns
+      -- The name a `namespace`, `section` or `end` command carries: one scope per component.
+      let scopeName : Name :=
+        if let some ns := nsName? then ns
+        else if kind == ``Parser.Command.«section» || kind == ``Parser.Command.«end» then
+          -- The optional name is the last child; `end`'s is an `identWithPartialTrailingDot`,
+          -- which wraps the identifier in another node.
+          (stx[stx.getNumArgs - 1]?.bind (findFirstIdent? ·)).map (·.getId) |>.getD .anonymous
+        else .anonymous
+      let components := nameComponents scopeName
+      let scopes := max 1 components.length
+      if nsName?.isSome then
+        for c in components do
+          nsPrefixStack := nsPrefixStack.push (nsPrefixStack.back!.str c)
+          closers := closers.push s!"end {c}"
       else if kind == ``Parser.Command.«section» then
-        nsPrefixStack := nsPrefixStack.push nsPrefixStack.back!
-      else if kind == ``Parser.Command.«end» && nsPrefixStack.size > 1 then
-        nsPrefixStack := nsPrefixStack.pop
-      if let some ns := nsName? then
-        closers := closers.push s!"end {ns}"
-      else if kind == ``Parser.Command.«section» then
-        closers := closers.push <| match stx[2]?.bind (·.getOptional?) with
-          | some id => s!"end {id.getId}"
-          | none => "end"
+        for _ in [0:scopes] do nsPrefixStack := nsPrefixStack.push nsPrefixStack.back!
+        closers := closers ++ (if components.isEmpty then #["end"]
+          else components.toArray.map (s!"end {·}"))
       else if kind == ``Parser.Command.«end» then
-        closers := closers.pop
+        for _ in [0:scopes] do
+          if nsPrefixStack.size > 1 then nsPrefixStack := nsPrefixStack.pop
+          closers := closers.pop
       let binders := if kind == ``Parser.Command.«variable» || kind == ``Parser.Command.«include»
           || kind == ``Parser.Command.«omit» then
         decomposeVariable source stx else #[]
@@ -766,7 +787,7 @@ def processFile (env : Environment) (source : String) (filePath : String)
         | some (attrs, targets) => (targets, attrs.any isTranslationAttribute)
         | none => (#[], false)
       entries := entries.push
-        { cls := .context, src := slice source cmdStart cmdEnd, kind, sectionSrc?, nsName?,
+        { cls := .context, src := slice source cmdStart cmdEnd, kind, sectionSrc?, scopes, nsName?,
           qualifiedNsName?, binders, openOnlyNamespace?, openOnlyIdents, attrTargets,
           attrIsTranslation }
     else
@@ -777,16 +798,30 @@ def processFile (env : Environment) (source : String) (filePath : String)
 
 /-! ## Phase 2: per-target filtering and section stripping -/
 
+/-- The last component of a declaration's name, read without the prefix of a private name. -/
+def shortName (n : Name) : String :=
+  match privateToUserName n with
+  | .str _ s => s
+  | .num _ i => toString i
+  | .anonymous => ""
+
 /-- Restricts declaration entries to those defining a declaration in `keep`; the rest become `skip`.
-Context entries are preserved, except an `open NS (a b c)` is trimmed to just the listed
-identifiers that are the short name of something in `keep` (or dropped entirely if none are) —
-keeping a name unconditionally would otherwise reference a declaration this target dropped, or
-even `NS` itself, in a target where nothing causes `NS` (or a stub for it) to exist at all.
-Identifiers are matched by short name only (not full path), so this can only under-drop (never
-wrongly drop a name that is actually needed), since a false-positive match just means a harmless
-extra name is kept in the list rather than the more precise outcome of dropping it. -/
-def restrictToTarget (entries : Array CommandEntry) (keep : Std.HashSet Name) : Array CommandEntry :=
-  let keepShortNames : Std.HashSet String := keep.fold (init := {}) fun s n => s.insert n.getString!
+Context entries are preserved, except that an `open NS (a b c)` loses the identifiers naming a
+project declaration left out of the file (and is dropped when none is left): such a name would be
+an undefined reference, as would `NS` itself in a target where nothing makes `NS` exist. A name
+from outside the project stays, being imported. `NS.a` is looked up as written; when it is not a
+constant (`NS` spelled relative to an open namespace), the short name decides: kept when something
+in `keep` has it, or when no project declaration does (`projectShortNames`). -/
+def restrictToTarget (env : Environment) (rootPrefix : Name) (projectShortNames : Std.HashSet String)
+    (entries : Array CommandEntry) (keep : Std.HashSet Name) : Array CommandEntry :=
+  let keepShortNames : Std.HashSet String :=
+    keep.fold (init := {}) fun s n => s.insert (shortName n)
+  let openKept (ns id : String) : Bool :=
+    let full := ns.toName ++ id.toName
+    if env.contains full then
+      !isProjectLocalConst env rootPrefix full || keep.contains full
+    else
+      keepShortNames.contains id || !projectShortNames.contains id
   entries.map fun e =>
     match e.cls with
     | .decl => if e.declNames.any keep.contains then e else { e with cls := .skip }
@@ -794,7 +829,7 @@ def restrictToTarget (entries : Array CommandEntry) (keep : Std.HashSet Name) : 
         match e.openOnlyNamespace? with
         | none => e
         | some ns =>
-            let kept := e.openOnlyIdents.filter keepShortNames.contains
+            let kept := e.openOnlyIdents.filter (openKept ns)
             if kept.isEmpty then { e with cls := .skip }
             else if kept.size == e.openOnlyIdents.size then e
             else { e with src := s!"open {ns} ({String.intercalate " " kept.toList})" }
@@ -976,6 +1011,9 @@ structure OutChunk where
   text : String
   /-- Project namespaces this chunk references; stubbed iff the chunk survives. -/
   namespaces : Array Name := #[]
+  /-- For a chunk opening or closing scopes, how many: one per component of the name, as Lean
+  counts them (`namespace A.B` opens two, `end A.B` closes two, `section` and `end` one). -/
+  scopes : Nat := 1
   /-- For a `set_option` chunk, the option it sets and the value it sets it to (see
   `dropRedundantOptions`). -/
   setOption? : Option (Name × String) := none
@@ -996,8 +1034,8 @@ def isOneScope (chunks : Array OutChunk) : Bool := Id.run do
   let mut depth : Int := 0
   for i in [0:chunks.size] do
     match chunks[i]!.tag with
-    | .openSection | .openNamespace => depth := depth + 1
-    | .close => depth := depth - 1
+    | .openSection | .openNamespace => depth := depth + chunks[i]!.scopes
+    | .close => depth := depth - chunks[i]!.scopes
     | _ => pure ()
     if depth == 0 then return i + 1 == chunks.size
   return false
@@ -1026,19 +1064,31 @@ def stripEmptyScopes (items : Array OutChunk) : Array OutChunk := Id.run do
       if stack.isEmpty then
         top := top.push c   -- unbalanced (shouldn't happen): emit verbatim
       else
-        let (openChunk, inner, hasContent) := stack.back!
-        stack := stack.pop
+        -- The open chunks this closes: as many as hold the scopes it closes (`end A.B` closes a
+        -- `namespace A.B`, or a `namespace A` and a `namespace B`).
+        let mut need : Int := c.scopes
+        let mut block : Array OutChunk := #[]
+        let mut hasContent := false
+        let mut opened := 0
+        while need > 0 && !stack.isEmpty do
+          let (o, inner, h) := stack.back!
+          stack := stack.pop
+          block := #[o] ++ inner ++ block
+          hasContent := hasContent || h
+          need := need - o.scopes
+          opened := opened + 1
         if hasContent then
           let rendered :=
-            if openChunk.tag == .openSection && openChunk.text == "section\n" && isOneScope inner
-            then inner
-            else (#[openChunk] ++ inner).push c
+            if opened == 1 && block[0]!.tag == .openSection && block[0]!.text == "section\n"
+                && isOneScope (block.extract 1 block.size)
+            then block.extract 1 block.size
+            else block.push c
           if stack.isEmpty then
             top := top ++ rendered
           else
             let (po, pl, _) := stack.back!
             stack := stack.set! (stack.size - 1) (po, pl ++ rendered, true)
-        -- else: drop the scope (open chunk, inner `soft` lines, and close chunk) entirely.
+        -- else: drop the scopes (open chunks, inner `soft` lines, and close chunk) entirely.
     | .soft =>
       if stack.isEmpty then
         top := top.push c
@@ -1067,10 +1117,11 @@ def dropReSetOptions (chunks : Array OutChunk) (inEffect : Std.HashMap Name Stri
   for c in chunks do
     match c.tag, c.setOption? with
     | .openSection, _ | .openNamespace, _ =>
-      scopes := scopes.push {}
+      for _ in [0:c.scopes] do scopes := scopes.push {}
       out := out.push c
     | .close, _ =>
-      if scopes.size > 1 then scopes := scopes.pop
+      for _ in [0:c.scopes] do
+        if scopes.size > 1 then scopes := scopes.pop
       out := out.push c
     | _, some (name, value) =>
       -- The innermost scope that has set this option is the one in effect.
@@ -1198,7 +1249,8 @@ closure (declarations to emit); `exposedNames` is every exposed declaration (to 
 to declarations *outside* `keep`). -/
 def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap Name (Array CommandEntry))
     (moduleOrder : Array Name) (exposedNames keep projectNamespaces : Std.HashSet Name)
-    (moduleOptions : Std.HashMap Name (Array (Name × String))) (target : Name) : String := Id.run do
+    (moduleOptions : Std.HashMap Name (Array (Name × String))) (projectShortNames : Std.HashSet String)
+    (target : Name) : String := Id.run do
   -- Modules contributing at least one kept declaration, in dependency order, with their filtered
   -- (and section-stripped) entries.
   let mut involved : Array (Name × Array CommandEntry) := #[]
@@ -1206,7 +1258,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     if let some entries := cache.get? modName then
       -- Keep every context command (so `namespace`/`section`/`end` nesting stays balanced) and the
       -- declarations in the closure; other declarations become `skip`.
-      let filtered := restrictToTarget entries keep
+      let filtered := restrictToTarget env rootPrefix projectShortNames entries keep
       -- A module contributes either declarations, or — even with none in the closure — standalone
       -- `attribute` commands, whose registrations the rest of the file may depend on (see
       -- `isContextCmd`). Without the second case the module is skipped wholesale and the
@@ -1319,14 +1371,15 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
           -- The namespace this enters needs a stub only if this block survives — hence carried on
           -- the chunk rather than collected from every `namespace` command in the module.
           items := items.push
-            { tag := .openNamespace, text := e.src ++ "\n"
+            { tag := .openNamespace, text := e.src ++ "\n", scopes := e.scopes
               namespaces := e.qualifiedNsName?.toArray }
         else if e.kind == ``Parser.Command.«section» then
           -- Every form of `section`, the module system's `@[expose] public section` included, as
           -- `replayedSection` renders it. An empty one goes in `stripEmptyScopes`.
-          items := items.push { tag := .openSection, text := e.sectionSrc?.getD e.src ++ "\n" }
+          items := items.push
+            { tag := .openSection, text := e.sectionSrc?.getD e.src ++ "\n", scopes := e.scopes }
         else if e.kind == ``Parser.Command.«end» then
-          items := items.push { tag := .close, text := e.src ++ "\n" }
+          items := items.push { tag := .close, text := e.src ++ "\n", scopes := e.scopes }
         else if e.kind == ``Parser.Command.«attribute» then
           -- Replayed only for translation attributes (see `translationAttributes`), and only when
           -- every name it targets actually exists here. The target test is stricter than
@@ -1581,6 +1634,9 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
             next := next.push m
       frontier := next
     return edges
+  -- The last components of the project's declaration names (`restrictToTarget`).
+  let projectShortNames : Std.HashSet String := exposedNames.fold (init := {}) fun s n =>
+    s.insert (shortName n)
   -- Phase 3: assemble and write one file per target.
   IO.FS.createDirAll dir
   for target in targets do
@@ -1594,7 +1650,7 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
           keep := keep.insert m
           todo := todo.push m
     let content := assembleTarget env rootPrefix cache moduleOrder exposedNames keep
-      projectNamespaces moduleOptions target
+      projectNamespaces moduleOptions projectShortNames target
     IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") content
   return targets.size
 

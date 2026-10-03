@@ -103,6 +103,10 @@ check("include hn" in read("Fixture.Inc.pos_succ"), "pos_succ: its include is no
 check("include b" not in read("Fixture.Inc.early") and "Big" not in read("Fixture.Inc.early"),
       "early: an include naming a binder left out is kept")
 
+check("open Nat (succ)" in read("Fixture.three"), "three: an open of a name from outside the project is dropped")
+check("instance : IsPositive three := sorry" in read("Fixture.instIsPositiveThree"),
+      "instIsPositiveThree: an instance of a Prop-valued class keeps its proof")
+
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
 print("ok: proofs, values, annotations, notation, sections, binders, options and closures")

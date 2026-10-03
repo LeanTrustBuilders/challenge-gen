@@ -7,3 +7,5 @@ import Fixture.ChoiceModule
 import Fixture.Scoped
 import Fixture.Twin
 import Fixture.Include
+import Fixture.Open
+import Fixture.Nested
