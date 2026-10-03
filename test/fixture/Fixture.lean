@@ -11,3 +11,6 @@ import Fixture.Open
 import Fixture.Nested
 import Fixture.Early
 import Fixture.Late
+import Fixture.Slice.A
+import Fixture.Other
+import Fixture.Slice.B

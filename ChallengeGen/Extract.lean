@@ -920,6 +920,21 @@ partial def externalImports (env : Environment) (rootPrefix : Name) (modules : A
         result := result.push m
   return result
 
+/-- Every module that `mods` import, directly or not, `mods` excluded. -/
+def importClosure (env : Environment) (mods : Array Name) : Std.HashSet Name := Id.run do
+  let mut seen : Std.HashSet Name := {}
+  let mut stack := mods.toList
+  while !stack.isEmpty do
+    let m := stack.head!
+    stack := stack.tail!
+    let some idx := env.getModuleIdx? m | continue
+    let some data := env.header.moduleData[idx.toNat]? | continue
+    for i in data.imports do
+      unless seen.contains i.module do
+        seen := seen.insert i.module
+        stack := i.module :: stack
+  return seen
+
 /-- Re-renders a `variable` command, dropping only the binders that reference an *excluded* exposed
 declaration — one outside the target's closure, hence not emitted here, so a reference to it would be
 an undefined name. `excludedNames` holds those declarations' full names.
@@ -1293,6 +1308,16 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   involved := involved.filter fun (_, entries) =>
     entries.any fun e =>
       e.cls == .decl || (e.cls == .context && e.kind == ``Parser.Command.«attribute» && e.attrIsTranslation)
+  -- The external modules to import. One may import a project module in turn, when the project is a
+  -- slice of a library (`Mathlib.Probability`, whose modules some `Mathlib.MeasureTheory` ones
+  -- import): such a module's declarations come with the import, and inlined as well, they would be
+  -- declared twice. It is left out. The target's own module never is: a module importing it comes
+  -- after it, and declares nothing this file needs.
+  let imports := externalImports env rootPrefix (involved.map (·.1))
+  let imported := importClosure env imports
+  let targetModule := involved.findSome? fun (m, entries) =>
+    if entries.any (fun e => e.cls == .decl && e.declNames.contains target) then some m else none
+  involved := involved.filter fun (m, _) => !imported.contains m || targetModule == some m
   -- The options every module of this file is built with, set once at its top. A module whose
   -- options are unknown (no `.setup.json`) is left out of the comparison.
   let common := commonOptions (involved.filterMap fun (m, _) => moduleOptions.get? m)
@@ -1461,7 +1486,6 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     (common.foldl (fun m (o, v) => m.insert o v) {})
   let body := String.join (kept.toList.map (·.text))
   let nsStubs := chunkNamespaces kept
-  let imports := externalImports env rootPrefix (involved.map (·.1))
   -- The extracted files are terminal and self-contained (nothing imports them), so the source's
   -- module-system scaffolding (`module` header, `public import`, `@[expose] public section`) is
   -- unnecessary: plain `import`s suffice, and the sections are replayed without it

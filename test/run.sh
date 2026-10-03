@@ -126,6 +126,16 @@ if ! python3 "$here/fidelity.py" "$work/fixture" "$work/out" Fixture "$work/fide
 fi
 echo "ok: every target states what the project states ($(cat "$work/fidelity.log"))"
 
+# A slice of the fixture as the project: `Fixture.Other`, outside it, imports one of its modules,
+# whose declarations must then come with the import rather than be inlined twice.
+(cd "$work/fixture" && lake env "$bin" --root Fixture.Slice --out "$work/slice" >/dev/null)
+if ! python3 "$here/fidelity.py" "$work/fixture" "$work/slice" Fixture "$work/fidelity-slice" 4 > "$work/fidelity-slice.log"; then
+  echo "FAIL: the files of a slice:" >&2
+  grep -A3 '^DIFFERS\|^fail' "$work/fidelity-slice/fidelity.txt" | head -20 >&2
+  exit 1
+fi
+echo "ok: a slice's files compile and state what the fixture states ($(cat "$work/fidelity-slice.log"))"
+
 (cd "$work/fixture" && lake env "$bin" --root Fixture --decl Fixture.Uses.quad --out "$work/one" >/dev/null)
 [ "$(ls "$work/one")" = "Fixture___Uses___quad.lean" ] || { echo "FAIL: --decl" >&2; ls "$work/one" >&2; exit 1; }
 cmp -s "$work/one/Fixture___Uses___quad.lean" "$work/out/Fixture___Uses___quad.lean" ||
