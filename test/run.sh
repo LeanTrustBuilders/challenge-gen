@@ -2,8 +2,8 @@
 # End-to-end test of challenge-gen on test/fixture.
 #
 # Builds the fixture, writes the file of every one of its declarations, compiles each file with
-# `lake env lean` (every one must compile), and checks what a few of them hold. Then writes the
-# file of one declaration only.
+# `lake env lean` (every one must compile), checks what a few of them hold, and that each target
+# states what the fixture states (test/fidelity.py). Then writes the file of one declaration only.
 #
 # Usage: test/run.sh [KEEP_DIR]   (after `lake build`)
 #   With KEEP_DIR, the generated files are copied to KEEP_DIR.
@@ -114,6 +114,14 @@ box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
 print("ok: proofs, values, annotations, notation, sections, binders, options and closures")
 EOF
+
+# Compiling is not enough: a file can compile and state another theorem than the project's.
+if ! python3 "$here/fidelity.py" "$work/fixture" "$work/out" Fixture "$work/fidelity" 4 > "$work/fidelity.log"; then
+  echo "FAIL: statements differ from the project's:" >&2
+  grep -A2 '^DIFFERS\|^fail' "$work/fidelity/fidelity.txt" | head -40 >&2
+  exit 1
+fi
+echo "ok: every target states what the project states ($(cat "$work/fidelity.log"))"
 
 (cd "$work/fixture" && lake env "$bin" --root Fixture --decl Fixture.Uses.quad --out "$work/one" >/dev/null)
 [ "$(ls "$work/one")" = "Fixture___Uses___quad.lean" ] || { echo "FAIL: --decl" >&2; ls "$work/one" >&2; exit 1; }

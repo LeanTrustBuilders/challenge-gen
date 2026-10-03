@@ -71,5 +71,9 @@ labelled `toolchain` instead. The branches of older toolchains get no further ch
 ## Tests
 
 `lake build ChallengeGenTest` runs the `#guard` checks in `ChallengeGen/Test.lean`. After
-`lake build`, `test/run.sh` writes the file of every declaration of `test/fixture` and compiles each
-one, then checks what some of them hold.
+`lake build`, `test/run.sh` writes the file of every declaration of `test/fixture`, compiles each
+one, checks what some of them hold, and checks that each target states what the fixture states.
+
+That last check works on any project: `test/fidelity.py <project> <files> <root module> <work dir>`
+compiles the files challenge-gen wrote for the project and compares each target's elaborated type
+with the project's own. A file can compile and still state another theorem.
