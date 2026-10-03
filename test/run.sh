@@ -107,6 +107,9 @@ check("open Nat (succ)" in read("Fixture.three"), "three: an open of a name from
 check("instance : IsPositive three := sorry" in read("Fixture.instIsPositiveThree"),
       "instIsPositiveThree: an instance of a Prop-valued class keeps its proof")
 
+check("def earlyId (ℵ : Nat) : Nat := ℵ" in (out / "earlyId.lean").read_text(),
+      "earlyId: a module parsed with syntax it does not import is cut")
+
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
 print("ok: proofs, values, annotations, notation, sections, binders, options and closures")

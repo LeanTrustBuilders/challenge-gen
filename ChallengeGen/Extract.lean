@@ -640,14 +640,13 @@ def decomposeOmit? (source : String) (stx : Syntax) :
 
 /-! ## Phase 1: process one source file -/
 
-/-- Re-elaborates `source` against `env` (`parseCommands`) and classifies every command. `declPos`
+/-- Classifies every command of `source`, parsed as `commands` (`parseCommands`). `declPos`
 maps the byte index where exposed declarations' ranges start to their names (so a command is a
 declaration command iff some such position falls inside it). `notationKinds` maps the syntax kind of
 each exposed notation, read without the prefix of a private name, to its declaration. -/
-def processFile (env : Environment) (source : String) (filePath : String)
+def processFile (env : Environment) (source : String) (commands : Array Syntax)
     (declPos : Std.HashMap Nat (Array Name)) (notationKinds : Std.HashMap Name Name) :
     IO (Array CommandEntry) := do
-  let commands ← parseCommands env source filePath
   let mut entries : Array CommandEntry := #[]
   -- Stack of the fully-qualified namespace prefix in effect *after* each currently-open
   -- `namespace`/`section` frame, so a `namespace` command nested inside another (rather than
@@ -1572,14 +1571,32 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
       (no .setup.json for {unknownOptions[0]!}, …): their files use Lean's defaults"
   -- Phase 1: process each contributing source file once.
   let mut cache : Std.HashMap Name (Array CommandEntry) := {}
+  let mut reparsed : Array Name := #[]
   for modName in moduleOrder do
     let modDecls := declsByModule.getD modName #[]
     let path := moduleSourcePath projectDir modName
     let some source ← (do try pure (some (← IO.FS.readFile path)) catch _ => pure none)
       | continue
     let declPos ← declPositions env source modDecls
-    let entries ← processFile env source path.toString declPos notationKinds
+    -- The source is parsed against the whole project, which holds syntax the module did not
+    -- import: a `scoped` notation `ℙ` that the module's `open ProbabilityTheory` activates turns its
+    -- binder `(ℙ : Measure Ω)` into a parse error. The project builds, so a command that does not
+    -- parse here can only be that; the module is parsed again against its own imports.
+    let mut commands ← parseCommands env source path.toString
+    if commands.any (·.hasMissing) then
+      if let some idx := env.getModuleIdx? modName then
+        if h : idx.toNat < env.header.moduleData.size then
+          -- Without running initializers again: the first import ran them, so every extension is
+          -- registered and gets its entries, the syntax among them (Lean refuses a second
+          -- `loadExts := true` import, `withImporting` having reset the flag).
+          let own ← importModules env.header.moduleData[idx.toNat].imports {} (loadExts := false)
+          commands ← parseCommands own source path.toString
+          reparsed := reparsed.push modName
+    let entries ← processFile env source commands declPos notationKinds
     cache := cache.insert modName entries
+  unless reparsed.isEmpty do
+    IO.eprintln s!"challenge-gen: {reparsed.size} modules parsed against their own imports \
+      ({reparsed[0]!}, …): the project's syntax did not parse them"
   -- Map each declaration to the notation parsers its source uses (gathered syntactically above).
   let mut declUsedNotations : Std.HashMap Name (Array Name) := {}
   -- Map each declaration to every exposed declaration its own source command also defines.

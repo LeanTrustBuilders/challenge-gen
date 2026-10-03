@@ -9,3 +9,5 @@ import Fixture.Twin
 import Fixture.Include
 import Fixture.Open
 import Fixture.Nested
+import Fixture.Early
+import Fixture.Late
