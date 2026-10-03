@@ -1590,6 +1590,17 @@ def neededDeps (ctx : MeaningGraph.Context) (cache : MeaningGraph.Cache)
 def projectDeclarations (ctx : MeaningGraph.Context) : Array Name :=
   ctx.constants.filterMap fun (n, _, _) => if ctx.exposed.contains n then some n else none
 
+private unsafe def importWithExtensionsImpl (imports : Array Import) : IO Environment := do
+  enableInitializersExecution
+  importModules imports {} (loadExts := true)
+
+/-- `importModules` with the environment extensions loaded, the syntax tables among them, in a
+process that has imported before. Lean clears the flag allowing initializers after each import
+(`withImporting`), so it is set again; the initializers of modules already loaded are not run again
+(`interpretedModInits`). -/
+@[implemented_by importWithExtensionsImpl]
+opaque importWithExtensions (imports : Array Import) : IO Environment
+
 /-- Writes a standalone `<anchorIdOf target>.lean` file into `dir` for each of `targets`, the
 declarations of the project `ctx` was made for (`MeaningGraph.Context.of env rootPrefix`), whose
 source files are under `projectDir`. Targets that are not declarations of the project are skipped.
@@ -1652,10 +1663,7 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
     if commands.any (·.hasMissing) then
       if let some idx := env.getModuleIdx? modName then
         if h : idx.toNat < env.header.moduleData.size then
-          -- Without running initializers again: the first import ran them, so every extension is
-          -- registered and gets its entries, the syntax among them (Lean refuses a second
-          -- `loadExts := true` import, `withImporting` having reset the flag).
-          let own ← importModules env.header.moduleData[idx.toNat].imports {} (loadExts := false)
+          let own ← importWithExtensions env.header.moduleData[idx.toNat].imports
           commands ← parseCommands own source path.toString
           reparsed := reparsed.push modName
     let entries ← processFile env source commands declPos notationKinds

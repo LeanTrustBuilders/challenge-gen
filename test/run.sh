@@ -107,7 +107,7 @@ check("open Nat (succ)" in read("Fixture.three"), "three: an open of a name from
 check("pos := by simp [three]" in read("Fixture.instIsPositiveThree"),
       "instIsPositiveThree: an instance's value, which decides the variables it takes, is replaced")
 
-check("def earlyId (ℵ : Nat) : Nat := ℵ" in (out / "earlyId.lean").read_text(),
+check("def earlyId (ℵ : Nat) : Nat := ⟪ℵ⟫" in (out / "earlyId.lean").read_text(),
       "earlyId: a module parsed with syntax it does not import is cut")
 
 check("instance instIsPositiveOfNat : Fixture.IsPositive 1" in read("Nat.instIsPositiveOfNat"),
