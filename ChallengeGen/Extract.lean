@@ -63,6 +63,11 @@ structure CommandEntry where
   /-- For a declaration command, whether its value is replaced by `sorry`: a proof with a value.
   What it needs is then what its statement needs (see `neededDeps`). -/
   valueDropped : Bool := false
+  /-- For a declaration command kept whole, whether its text was changed: a proof inside its value
+  or a field's default replaced by `sorry`, or a `deriving` clause by instances. Lean decides which
+  section variables a definition takes from its value, so such a declaration may take fewer than
+  the project's: `restoreVariables` checks. -/
+  altered : Bool := false
   /-- For a `section` command, the command as replayed (`replayedSection`). -/
   sectionSrc? : Option String := none
   /-- For a `namespace`, `section` or `end` command, how many scopes it opens or closes: one per
@@ -311,6 +316,11 @@ def isContextCmd (stx : Syntax) : Bool :=
     -- entry, which are the ones whose loss makes *other* declarations fail to elaborate.
     || k == ``Parser.Command.«attribute»
     || isNotationCmd k
+
+/-- The `sorry` replacing the first proof in a declaration's value, marked (by a character of a
+private use area, which no source contains) as the place where `restoreVariables` may mention the
+variables that proof used. `assembleTarget` removes the mark. -/
+def markedSorry : String := "sorry\uE000"
 
 /-- The substring of `source` between two byte positions. -/
 def slice (source : String) (s e : String.Pos.Raw) : String :=
@@ -734,6 +744,40 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
       -- `pruneOmit` can re-render the prefix per target. Edits before `start` are irrelevant to
       -- that slice and are dropped, since `applyEdits` reads its edits in position order.
+      -- The edits inside the value of a declaration kept whole.
+      let valueEdits : Array (String.Pos.Raw × String.Pos.Raw × String) :=
+        if isProof then #[]
+        else if isStructureDecl stx then
+          -- A structure/class field's default value (`field : T := by tac`) is a
+          -- `Term.binderTactic` in the `structFields` node — neither a `Term.byTactic` nor part of
+          -- any `declVal`, so the scan below never sees it and the tactic is emitted verbatim. It
+          -- then has to run inside the minimal file, where the lemma sets it relies on
+          -- (`measurability`, `fun_prop`, …) are not populated, and every construction of the
+          -- structure that omits the field fails with "could not synthesize default value for
+          -- field". `binderTactic` spans its own ` := by `, so the replacement has to restore the
+          -- `:=`. Only in the fields: a `:= by tac` default among the structure's parameters is an
+          -- `autoParam` of its type, which `sorry` would change (`IsBrownianReal X` would mean "for
+          -- the measure `sorry`").
+          ((findFirstOfKind? stx ``Parser.Command.structFields).map collectBinderTactics
+            |>.getD #[]).map fun (bs, be) => (bs, be, ":= sorry")
+        else
+          let byBlocks := match findDeclValStx? stx with
+            | some v => collectByBlocks v
+            | none => #[]
+          -- Keep the blocks that *are* a value rather than sitting inside one: replacing those
+          -- would drop the `variable` binders the body mentions and change the declaration's
+          -- signature. See `wholeValueTacticRanges`.
+          let spared := wholeValueTacticRanges stx
+          let byBlocks := byBlocks.filter fun (r : String.Pos.Raw × String.Pos.Raw) =>
+            !spared.any fun (s : String.Pos.Raw × String.Pos.Raw) =>
+              s.1.byteIdx == r.1.byteIdx && s.2.byteIdx == r.2.byteIdx
+          let first := byBlocks.foldl (fun m (r : String.Pos.Raw × String.Pos.Raw) =>
+            min m r.1.byteIdx) source.utf8ByteSize
+          byBlocks.map fun (bs, be) => (bs, be, if bs.byteIdx == first then markedSorry else "sorry")
+      -- Renders the command from `start`, which is either the command's own start or — for a
+      -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
+      -- `pruneOmit` can re-render the prefix per target. Edits before `start` are irrelevant to
+      -- that slice and are dropped, since `applyEdits` reads its edits in position order.
       let mkSrc (start : String.Pos.Raw) : String :=
         let prefixEdits := prefixEdits.filter fun (r : String.Pos.Raw × String.Pos.Raw × String) =>
           r.1.byteIdx ≥ start.byteIdx
@@ -742,34 +786,7 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
           | some (valStart, _) => applyEdits source start valStart prefixEdits ++ ":= sorry"
           | none => applyEdits source start cmdEnd prefixEdits
         else
-          let edits :=
-            if isStructureDecl stx then
-              -- A structure/class field's default value (`field : T := by tac`) is a
-              -- `Term.binderTactic` in the `structFields` node — neither a `Term.byTactic` nor
-              -- part of any `declVal`, so the scan below never sees it and the tactic is emitted
-              -- verbatim. It then has to run inside the minimal file, where the lemma sets it
-              -- relies on (`measurability`, `fun_prop`, …) are not populated, and every
-              -- construction of the structure that omits the field fails with "could not
-              -- synthesize default value for field". `binderTactic` spans its own ` := by `, so
-              -- the replacement has to restore the `:=`.
-              -- Only in the fields: a `:= by tac` default among the structure's parameters is
-              -- an `autoParam` of its type, which `sorry` would change (`IsBrownianReal X` would
-              -- mean "for the measure `sorry`").
-              ((findFirstOfKind? stx ``Parser.Command.structFields).map collectBinderTactics
-                |>.getD #[]).map fun (bs, be) => (bs, be, ":= sorry")
-            else
-              let byBlocks := match findDeclValStx? stx with
-                | some v => collectByBlocks v
-                | none => #[]
-              -- Keep the blocks that *are* a value rather than sitting inside one: replacing those
-              -- would drop the `variable` binders the body mentions and change the declaration's
-              -- signature. See `wholeValueTacticRanges`.
-              let spared := wholeValueTacticRanges stx
-              let byBlocks := byBlocks.filter fun (r : String.Pos.Raw × String.Pos.Raw) =>
-                !spared.any fun (s : String.Pos.Raw × String.Pos.Raw) =>
-                  s.1.byteIdx == r.1.byteIdx && s.2.byteIdx == r.2.byteIdx
-              byBlocks.map fun (bs, be) => (bs, be, "sorry")
-          applyEdits source start declEnd (prefixEdits ++ edits)
+          applyEdits source start declEnd (prefixEdits ++ valueEdits)
       let src := mkSrc cmdStart
       let (omitBinders, srcNoOmit?) :=
         match decomposeOmit? source stx with
@@ -778,9 +795,10 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       let usedNotations := (collectSyntaxKinds stx).toArray.filterMap fun k =>
         notationKinds.get? (privateToUserName k)
       let valueDropped := isProof && (findDeclVal? stx).isSome
+      let altered := !valueEdits.isEmpty || !appended.isEmpty
       entries := entries.push
-        { cls := .decl, src, kind := stx.getKind, declNames := names, valueDropped, appended,
-          usedNotations, omitBinders, srcNoOmit? }
+        { cls := .decl, src, kind := stx.getKind, declNames := names, valueDropped, altered,
+          appended, usedNotations, omitBinders, srcNoOmit? }
     else if isContextCmd stx then
       let kind := stx.getKind
       let nsName? := if kind == ``Parser.Command.namespace && stx.getArgs.size ≥ 2 then
@@ -1299,6 +1317,23 @@ def openedNamespaces (known : Std.HashSet Name) (prefixes : Array Name)
     if let some ns := resolved? then acc := acc.push ns
   return acc
 
+/-- Changes to a file restoring the section variables its altered declarations lost
+(`restoreVariables`): for a declaration, the terms its first replaced proof mentions, a variable's
+name or `(inferInstance : C)` for an anonymous instance binder. -/
+structure Fixes where
+  mentions : Std.HashMap Name (Array String) := {}
+  deriving Inhabited
+
+/-- A file as `assembleTarget` writes it, with what `restoreVariables` reads of it. -/
+structure Assembled where
+  text : String
+  /-- The modules it imports. -/
+  imports : Array Name
+  /-- The declarations of its altered commands (`CommandEntry.altered`). -/
+  altered : Array Name
+  /-- The binders of its `variable` commands, as written. -/
+  variableBinders : Array String
+
 /-- Assembles the standalone file for `target`. `cache` holds the processed entries per module;
 `moduleOrder` lists the project modules in dependency-first order; `keep` is the target's transitive
 closure (declarations to emit); `exposedNames` is every exposed declaration (to recognise references
@@ -1306,7 +1341,7 @@ to declarations *outside* `keep`). -/
 def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap Name (Array CommandEntry))
     (moduleOrder : Array Name) (exposedNames keep projectNamespaces : Std.HashSet Name)
     (moduleOptions : Std.HashMap Name (Array (Name × String))) (projectShortNames : Std.HashSet String)
-    (target : Name) : String := Id.run do
+    (target : Name) (fixes : Fixes := {}) : Assembled := Id.run do
   -- Modules contributing at least one kept declaration, in dependency order, with their filtered
   -- (and section-stripped) entries.
   let mut involved : Array (Name × Array CommandEntry) := #[]
@@ -1393,6 +1428,8 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- entered (`namespace`) or opened (`open`) namespace. Accumulated (never popped) as an
   -- over-approximation of scope; `entryKept` only matches exact excluded names against it.
   let mut activePrefixes : Array Name := #[Name.anonymous]
+  let mut altered : Array Name := #[]
+  let mut variableBinders : Array String := #[]
   -- The names bound by the `variable` binders kept so far, which `include` and `omit` may name.
   let mut bound : Std.HashSet Name := {}
   for (modName, entries) in involved do
@@ -1424,6 +1461,8 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
           for (bsrc, idents) in e.binders do
             if entryOk (bsrc, idents) then
               bound := (binderBoundNames bsrc).foldl (·.insert ·.toName) bound
+          for (bsrc, idents) in e.binders do
+            if entryOk (bsrc, idents) then variableBinders := variableBinders.push bsrc
           if let some v := pruneEntries entryOk "variable" e then
             items := items.push { tag := .soft, text := v ++ "\n" }
         else if e.kind == ``Parser.Command.«include» || e.kind == ``Parser.Command.«omit» then
@@ -1488,6 +1527,13 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
       | .decl =>
         let body := pruneOmit
           (entryKept env rootPrefix excludedNames activePrefixes boundVars boundVarTypes bound) e
+        -- The variables its altered text no longer uses but the project's declaration takes are
+        -- mentioned where its first replaced proof was: `(have := hk; sorry)`.
+        let mentions := e.declNames.foldl (init := #[]) fun acc n =>
+          (fixes.mentions.getD n #[]).foldl (fun acc v => if acc.contains v then acc else acc.push v) acc
+        let body := body.replace markedSorry <| if mentions.isEmpty then "sorry"
+          else "(" ++ String.join (mentions.toList.map (s!"have := {·}; ")) ++ "sorry)"
+        if e.altered then altered := altered ++ e.declNames
         let mut s := "\n" ++ body ++ "\n"
         for extra in e.appended do
           s := s ++ extra ++ "\n"
@@ -1531,7 +1577,8 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for ns in nsStubs do
       out := out ++ s!"namespace {ns}\nend {ns}\n"
   out := out ++ body
-  return (collapseBlankRuns out).trimAscii.toString ++ "\n"
+  return { text := (collapseBlankRuns out).trimAscii.toString ++ "\n", imports, altered,
+           variableBinders }
 
 /-! ## Driver -/
 
@@ -1600,6 +1647,110 @@ process that has imported before. Lean clears the flag allowing initializers aft
 (`interpretedModInits`). -/
 @[implemented_by importWithExtensionsImpl]
 opaque importWithExtensions (imports : Array Import) : IO Environment
+
+/-! ## Restoring section variables
+
+Lean decides which section variables a definition or an instance takes from its value. An altered
+declaration (`CommandEntry.altered`), a proof in its value replaced by `sorry`, may therefore take
+fewer than the project's: `isGaussian_map := isGaussian_map_of_measurable (by fun_prop)` takes
+`[BorelSpace E]` only because `fun_prop`'s proof uses it, and with `sorry` it states a weaker
+theorem. Which variables a replaced proof used cannot be read off the source, an instance binder
+being used by instance search: the file is elaborated, and its types compared with the project's.
+-/
+
+/-- Elaborates the text of a file, against an environment of `imports`, and returns the environment
+it ends with. Errors are ignored: only the declarations that elaborate are read. -/
+def elabFile (imports : Array Name) (text : String) : IO Environment := do
+  let env ← importWithExtensions ((#[`Init] ++ imports).map ({ module := · }))
+  let inputCtx := Parser.mkInputContext text "<challenge>"
+  let (_, parserState, messages) ← Parser.parseHeader inputCtx
+  let s ← IO.processCommands inputCtx parserState (Command.mkState env messages {})
+  return s.commandState.env
+
+/-- The positions, in the telescope of `project` (a declaration's type in the project), of the
+binders that `file` (its type in an extracted file) lacks, when the binders of `file` are those of
+`project` with some left out; `none` when they do not align so. -/
+partial def missingBinders (project file : Expr) : Option (Array Nat) :=
+  go project file 0 #[]
+where
+  go (p f : Expr) (i : Nat) (acc : Array Nat) : Option (Array Nat) :=
+    let x := mkFVar ⟨.num `_challengeGen i⟩
+    match p, f with
+    | .forallE _ pt pb _, .forallE _ ft fb _ =>
+      if pt == ft then go (pb.instantiate1 x) (fb.instantiate1 x) (i + 1) acc
+      else go (pb.instantiate1 x) f (i + 1) (acc.push i)
+    | .forallE _ _ pb _, _ => go (pb.instantiate1 x) f (i + 1) (acc.push i)
+    | _, .forallE .. => none
+    | _, _ => some acc
+
+/-- The name and printed type of each binder in the telescope of `type`. -/
+def binderInfos (type : Expr) : MetaM (Array (Name × String)) :=
+  Meta.forallTelescope type fun xs _ => xs.mapM fun x => do
+    let d ← x.fvarId!.getDecl
+    return (d.userName, toString (← Meta.ppExpr d.type))
+
+/-- A type as printed or written, compared up to spaces and namespaces: each dotted name is read
+as its last component, since the file's `open`s shorten what the printer writes in full. -/
+def typeKey (text : String) : String :=
+  let words := (text.split (·.isWhitespace)).toList.map fun w =>
+    let w := w.toString
+    -- `(MeasureTheory.Measure.map` reads `(map`: what precedes the name, and its last component.
+    let lead := w.takeWhile (fun c => !isIdFirst c && c != '«')
+    let rest := (w.drop lead.length).toString
+    if (rest.splitOn ".").length > 1 && rest.all (fun c => isIdRest c || c == '.' || c == ')' || c == ']') then
+      lead.toString ++ ((rest.splitOn ".").getLast!)
+    else w
+  String.join words
+
+/-- The type of an anonymous instance binder as written, `[C]` without its brackets. -/
+def instanceBinderType? (binder : String) : Option String :=
+  let b := binder.trimAscii.toString
+  if b.startsWith "[" && b.endsWith "]" && (b.splitOn ":").length == 1 then
+    some ((b.drop 1).dropEnd 1).trimAscii.toString
+  else none
+
+/-- The text of `assemble`'s file, with the section variables its altered declarations lost
+restored. A definition or an instance takes the variables its value uses (`include` forces one
+into theorems only), so each lost variable is mentioned where the declaration's first replaced
+proof was: `(have := hk; sorry)` for a named one, `(have := (inferInstance : BorelSpace E); sorry)`
+for an anonymous instance binder, instance search finding the variable. Repeated until nothing is
+missing, at most three times. A variable that cannot be restored so is reported. -/
+def restoreVariables (env : Environment) (assemble : Fixes → Assembled) : IO String := do
+  let mut fixes : Fixes := {}
+  let mut file := assemble fixes
+  for _ in [0:3] do
+    if file.altered.isEmpty then break
+    let fileEnv ← elabFile file.imports file.text
+    let mut changed := false
+    for n in file.altered do
+      let some p := env.find? n | continue
+      let some f := fileEnv.find? n | continue
+      let some missing := missingBinders p.type f.type | continue
+      if missing.isEmpty then continue
+      let binders ← runMetaIO env (binderInfos p.type)
+      for i in missing do
+        let some (userName, typeText) := binders[i]? | continue
+        let mention? : Option String :=
+          if !userName.hasMacroScopes then
+            -- A named variable, bound by a binder the file kept.
+            if file.variableBinders.any (fun b => (binderBoundNames b).contains userName.toString)
+            then some userName.toString else none
+          else
+            -- An anonymous instance binder, by its type as written in the file's `variable`.
+            (file.variableBinders.findSome? fun b => (instanceBinderType? b).filter
+              (typeKey · == typeKey typeText)).map (s!"(inferInstance : {·})")
+        match mention? with
+        | some m =>
+          let current := fixes.mentions.getD n #[]
+          unless current.contains m do
+            fixes := { fixes with mentions := fixes.mentions.insert n (current.push m) }
+            changed := true
+        | none =>
+          IO.eprintln s!"challenge-gen: {n} takes the variable `{typeText}` in the project, which \
+            its file does not restore"
+    if !changed then break
+    file := assemble fixes
+  return file.text
 
 /-- Writes a standalone `<anchorIdOf target>.lean` file into `dir` for each of `targets`, the
 declarations of the project `ctx` was made for (`MeaningGraph.Context.of env rootPrefix`), whose
@@ -1740,8 +1891,9 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
         unless keep.contains m do
           keep := keep.insert m
           todo := todo.push m
-    let content := assembleTarget env rootPrefix cache moduleOrder exposedNames keep
-      projectNamespaces moduleOptions projectShortNames target
+    let assemble := fun fixes => assembleTarget env rootPrefix cache moduleOrder exposedNames keep
+      projectNamespaces moduleOptions projectShortNames target fixes
+    let content ← restoreVariables env assemble
     IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") content
   return targets.size
 

@@ -22,6 +22,18 @@ variable {m : Nat} [IsPositive m]
 variables its value uses, so its value cannot become `sorry` without changing its signature. -/
 instance : IsPositive (m * 1) := by simpa using (inferInstance : IsPositive m)
 
+/-- Only its embedded proof uses `[IsPositive m]`: with that proof replaced by `sorry`, the instance
+would not take it, unless the `sorry` mentions it. -/
+instance : IsPositive (m + 0) := ⟨by have := (inferInstance : IsPositive m).pos; omega⟩
+
+end
+
+section
+variable (k : Nat) (hk : 0 < k)
+
+/-- Only its embedded proof uses `hk`. -/
+def predBelow : { j : Nat // j < k } := ⟨k - 1, by omega⟩
+
 end
 
 /-- Derived in the namespace of the definition, `Fixture.Wrap`, not the current one. -/

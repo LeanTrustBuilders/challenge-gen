@@ -13,10 +13,11 @@ The declarations are copied verbatim, with the `namespace`, `section`, `open`, `
 `universe`, `set_option` and notation commands around them, so the file reads the way its author
 wrote it. Then:
 
-- a proof is replaced by `sorry`: a theorem's, or the value of a command whose declarations are
-  all theorems, such as an instance of a `Prop`-valued class. So are the proofs inside a
-  definition's value, except a tactic block that is the whole value: Lean decides from it which
-  section variables the definition takes;
+- a theorem's proof is replaced by `sorry`, and so are the proofs inside a definition's or an
+  instance's value, except a tactic block that is the whole value. Lean decides from a definition's
+  value which section variables it takes: when a replaced proof was the only use of one, the
+  `sorry` mentions it, `(have := hk; sorry)` or `(have := (inferInstance : BorelSpace E); sorry)`,
+  as a check of the file against the project finds;
 - a field's default `:= by tac` becomes `:= sorry`, and a definition's `deriving` clause becomes
   `instance … := sorry`;
 - the annotations of [TrustAnnotations](https://github.com/LeanTrustBuilders/annotations)

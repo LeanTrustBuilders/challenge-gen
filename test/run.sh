@@ -118,6 +118,13 @@ check("instance Wrap.instBEqNum : BEq (Wrap.Num) := sorry" in read("Fixture.Wrap
 check("structure Sized (n : Nat := by exact 3)" in read("Fixture.Sized"),
       "Sized: a parameter's tactic default, part of the structure's type, is replaced")
 
+check("⟨k - 1, (have := hk; sorry)⟩" in read("Fixture.predBelow"),
+      "predBelow: a named variable only its replaced proof used is not mentioned")
+check("⟨(have := (inferInstance : IsPositive m); sorry)⟩" in read("Fixture.instIsPositiveHAddNatOfNat"),
+      "instIsPositiveHAddNatOfNat: an instance binder only its replaced proof used is not mentioned")
+for f in out.glob("*.lean"):
+    check("\ue000" not in f.read_text(), f"{f.name}: the mark of a replaced proof is left")
+
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
 print("ok: proofs, values, annotations, notation, sections, binders, options and closures")
