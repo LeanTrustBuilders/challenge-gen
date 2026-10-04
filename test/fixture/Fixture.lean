@@ -6,6 +6,7 @@ import Fixture.Choice
 import Fixture.ChoiceModule
 import Fixture.Private
 import Fixture.Reuse
+import Fixture.Layers.Paper
 import Fixture.Scoped
 import Fixture.Twin
 import Fixture.Include

@@ -185,6 +185,32 @@ python3 -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["theorem_nam
   { echo "FAIL: a theorem the file imports is to be checked" >&2; exit 1; }
 echo "ok: a slice's files compile and state what the fixture states ($(cat "$work/fidelity-slice.log"))"
 
+# A paper on a dependency, whose files may import only the library under it (`--import`): they copy
+# what they need of the dependency.
+(cd "$work/fixture" && lake env "$bin" --root Fixture.Layers.Paper --import Fixture.Layers.Lib \
+  --out "$work/layers" >/dev/null)
+python3 - "$work/layers" <<'EOF'
+import json, pathlib, re, sys
+out = pathlib.Path(sys.argv[1])
+text = (out / "Fixture___Layers___paper_main.lean").read_text()
+imports = re.findall(r"^public (?:meta )?import (\S+)$", text, re.M)
+if imports != ["Fixture.Layers.Lib"]:
+    sys.exit(f"FAIL: --import: the paper's file imports {imports}, not the library alone")
+if "def scaledPos" not in text or "theorem scaled_pos (n : Nat) (h : 0 < n) : 0 < scaled n := sorry" not in text:
+    sys.exit("FAIL: --import: what the paper needs of the dependency is not copied")
+if "unused" in text or "def libBase" in text:
+    sys.exit("FAIL: --import: the file copies what it does not need, or what it imports")
+names = json.loads((out / "Fixture___Layers___paper_main.json").read_text())["theorem_names"]
+if names != ["Fixture.Layers.paper_main", "Fixture.Layers.scaled_pos"]:
+    sys.exit(f"FAIL: --import: the theorems to check are {names}")
+EOF
+if ! python3 "$here/fidelity.py" "$work/fixture" "$work/layers" Fixture "$work/fidelity-layers" 4 > "$work/fidelity-layers.log"; then
+  echo "FAIL: the files of a paper on a dependency:" >&2
+  grep -A3 '^DIFFERS\|^UNLISTED\|^fail' "$work/fidelity-layers/fidelity.txt" | head -20 >&2
+  exit 1
+fi
+echo "ok: --import copies what the files need of a dependency and imports the library ($(cat "$work/fidelity-layers.log"))"
+
 (cd "$work/fixture" && lake env "$bin" --root Fixture --decl Fixture.Uses.quad --out "$work/one" >/dev/null)
 [ "$(ls "$work/one" | tr '\n' ' ')" = "Fixture___Uses___quad.json Fixture___Uses___quad.lean " ] || { echo "FAIL: --decl" >&2; ls "$work/one" >&2; exit 1; }
 for ext in lean json; do

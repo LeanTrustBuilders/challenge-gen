@@ -672,15 +672,16 @@ project declaration left out of the file (and is dropped when none is left): suc
 an undefined reference, as would `NS` itself in a target where nothing makes `NS` exist. A name
 from outside the project stays, being imported. `NS.a` is looked up as written; when it is not a
 constant (`NS` spelled relative to an open namespace), the short name decides: kept when something
-in `keep` has it, or when no project declaration does (`projectShortNames`). -/
-def restrictToTarget (env : Environment) (rootPrefix : Name) (projectShortNames : Std.HashSet String)
+in `keep` has it, or when no project declaration does (`projectShortNames`). `isProject` says
+whether a constant is the project's. -/
+def restrictToTarget (env : Environment) (isProject : Name → Bool) (projectShortNames : Std.HashSet String)
     (entries : Array CommandEntry) (keep : Std.HashSet Name) : Array CommandEntry :=
   let keepShortNames : Std.HashSet String :=
     keep.fold (init := {}) fun s n => s.insert (shortName n)
   let openKept (ns id : String) : Bool :=
     let full := ns.toName ++ id.toName
     if env.contains full then
-      !isProjectLocalConst env rootPrefix full || keep.contains full
+      !isProject full || keep.contains full
     else
       keepShortNames.contains id || !projectShortNames.contains id
   entries.map fun e =>
@@ -735,8 +736,8 @@ project module. So we walk the import graph transitively through project modules
 external "frontier" — every external module directly imported by any project module reachable from
 `modules`, less the `excludedImports`. `public import`ing those covers their transitive
 dependencies. A module the project imports with `meta`, for the code it runs while elaborating
-(`public meta import`), is imported so again. -/
-partial def externalImports (env : Environment) (rootPrefix : Name) (modules : Array Name) :
+(`public meta import`), is imported so again. `inProject` says whether a module is the project's. -/
+partial def externalImports (env : Environment) (inProject : Name → Bool) (modules : Array Name) :
     Array Import := Id.run do
   let directImports (modName : Name) : Array Import := Id.run do
     let some idx := env.getModuleIdx? modName | return #[]
@@ -755,7 +756,7 @@ partial def externalImports (env : Environment) (rootPrefix : Name) (modules : A
     for i in directImports modName do
       let m := i.module
       if m == `Init then continue
-      if hasPrefixName m rootPrefix then
+      if inProject m then
         stack := m :: stack            -- project module: recurse into its imports
       else if isExcludedImport m then
         continue                       -- external, but deliberately not imported (see above)
@@ -779,6 +780,14 @@ def importClosure (env : Environment) (mods : Array Name) : Std.HashSet Name := 
         stack := i.module :: stack
   return seen
 
+/-- The modules a file may import when it may import those under `prefixes`: the modules of `env`
+under one of them, and every module these import, directly or not. The project made of the other
+modules (`MeaningGraph.Context.ofModules`) is closed downstream, as MeaningGraph requires: a module
+importing one of them is not importable either. -/
+def importableModules (env : Environment) (prefixes : Array Name) : Std.HashSet Name :=
+  let marked := env.header.moduleNames.filter fun m => prefixes.any (hasPrefixName m ·)
+  marked.foldl (·.insert ·) (importClosure env marked)
+
 /-- Re-renders a `variable` command, dropping only the binders that reference an *excluded* exposed
 declaration — one outside the target's closure, hence not emitted here, so a reference to it would be
 an undefined name. `excludedNames` holds those declarations' full names.
@@ -799,7 +808,7 @@ resurrect exactly the `IndexedPartition` confusion the guard above exists to pre
 has its own top-level `IsComplete`.
 
 Returns `none` if no binder survives. -/
-def binderRefsExcluded (env : Environment) (rootPrefix : Name) (excludedNames : Std.HashSet Name)
+def binderRefsExcluded (env : Environment) (isProject : Name → Bool) (excludedNames : Std.HashSet Name)
     (activePrefixes : Array Name) (boundVars : Std.HashSet Name)
     (boundVarTypes : Std.HashMap Name Name) (id : String) : Bool :=
   let resolvesToExcluded (n : Name) : Bool :=
@@ -815,7 +824,7 @@ def binderRefsExcluded (env : Environment) (rootPrefix : Name) (excludedNames : 
   let n := id.toName
   if boundVars.contains n then
     false   -- a locally-bound `variable` name, not a global reference
-  else if env.contains n && !isProjectLocalConst env rootPrefix n then
+  else if env.contains n && !isProject n then
     false   -- an external (e.g. Mathlib) constant, not a project reference
   else
     resolvesToExcluded n || fieldNotationExcluded n
@@ -825,7 +834,7 @@ survives unless one of its identifiers names a declaration left out of the file
 (`binderRefsExcluded`). A bare variable name, as `include` and `omit` take, survives only if a
 binder of that name did (`bound`): `include hf` after the binder `(hf : P f)` was dropped would
 name no variable. -/
-def entryKept (env : Environment) (rootPrefix : Name) (excludedNames : Std.HashSet Name)
+def entryKept (env : Environment) (isProject : Name → Bool) (excludedNames : Std.HashSet Name)
     (activePrefixes : Array Name) (boundVars : Std.HashSet Name)
     (boundVarTypes : Std.HashMap Name Name) (bound : Std.HashSet Name)
     (entry : String × Array String) : Bool :=
@@ -833,7 +842,7 @@ def entryKept (env : Environment) (rootPrefix : Name) (excludedNames : Std.HashS
   if idents.size == 1 && src.trimAscii.toString == idents[0]! then
     bound.contains idents[0]!.toName
   else
-    !idents.any (binderRefsExcluded env rootPrefix excludedNames activePrefixes boundVars
+    !idents.any (binderRefsExcluded env isProject excludedNames activePrefixes boundVars
       boundVarTypes)
 
 /-- Renders a `variable`, `include` or `omit` command with the entries that survive (`entryKept`),
@@ -1132,11 +1141,12 @@ structure Assembled where
 /-- Assembles the standalone file for `target`. `cache` holds the processed entries per module;
 `moduleOrder` lists the project modules in dependency-first order; `keep` is the target's transitive
 closure (declarations to emit); `exposedNames` is every exposed declaration (to recognise references
-to declarations *outside* `keep`). -/
-def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap Name (Array CommandEntry))
+to declarations *outside* `keep`); `inProject` says whether a module is the project's. -/
+def assembleTarget (env : Environment) (inProject : Name → Bool) (cache : Std.HashMap Name (Array CommandEntry))
     (moduleOrder : Array Name) (exposedNames keep projectNamespaces : Std.HashSet Name)
     (moduleOptions : Std.HashMap Name (Array (Name × String))) (projectShortNames : Std.HashSet String)
     (target : Name) : Assembled := Id.run do
+  let isProject (c : Name) : Bool := (moduleNameOf env c).any inProject
   -- Modules contributing at least one kept declaration, in dependency order, with their filtered
   -- (and section-stripped) entries.
   let mut involved : Array (Name × Array CommandEntry) := #[]
@@ -1144,7 +1154,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     if let some entries := cache.get? modName then
       -- Keep every context command (so `namespace`/`section`/`end` nesting stays balanced) and the
       -- declarations in the closure; other declarations become `skip`.
-      let filtered := restrictToTarget env rootPrefix projectShortNames entries keep
+      let filtered := restrictToTarget env isProject projectShortNames entries keep
       -- A module contributes either declarations, or — even with none in the closure — standalone
       -- `attribute` commands, whose registrations the rest of the file may depend on (see
       -- `isContextCmd`). Without the second case the module is skipped wholesale and the
@@ -1165,7 +1175,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- import): such a module's declarations come with the import, and inlined as well, they would be
   -- declared twice. It is left out. The target's own module never is: a module importing it comes
   -- after it, and declares nothing this file needs.
-  let imports := externalImports env rootPrefix (involved.map (·.1))
+  let imports := externalImports env inProject (involved.map (·.1))
   let imported := importClosure env (imports.map (·.module))
   let targetModule := involved.findSome? fun (m, entries) =>
     if entries.any (fun e => e.cls == .decl && e.declNames.contains target) then some m else none
@@ -1227,14 +1237,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- The names bound by the `variable` binders kept so far, which `include` and `omit` may name.
   let mut bound : Std.HashSet Name := {}
   for (modName, entries) in involved do
-    -- The module's path below the root (`Foo.Bar` under root `Foo` reads as `Bar`), except for the
-    -- root module itself, whose path below the root is empty.
-    let shortName :=
-      if modName == rootPrefix then modName.toString
-      else if hasPrefixName modName rootPrefix then
-        (modName.toString.drop (rootPrefix.toString.length + 1)).toString
-      else modName.toString
-    items := items.push { tag := .hard, text := s!"\n-- ═══ {shortName} ═══\n" }
+    items := items.push { tag := .hard, text := s!"\n-- ═══ {modName} ═══\n" }
     -- Wraps each module's replayed content in its own `section … end`, so its `open` commands
     -- (which, unlike `notation`/`def`/etc., are scoped by `section`) don't leak into later
     -- modules. Without this, each contributing module's `open`s pile up across the whole
@@ -1255,7 +1258,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for e in entries do
       match e.cls with
       | .context =>
-        let entryOk := entryKept env rootPrefix excludedNames activePrefixes boundVars boundVarTypes bound
+        let entryOk := entryKept env isProject excludedNames activePrefixes boundVars boundVarTypes bound
         if e.kind == ``Parser.Command.«variable» then
           for (bsrc, idents) in e.binders do
             if entryOk (bsrc, idents) then
@@ -1292,7 +1295,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
             let n := id.toName
             activePrefixes.any fun pfx =>
               let full := pfx ++ n
-              env.contains full && isProjectLocalConst env rootPrefix full && !keep.contains full
+              env.contains full && isProject full && !keep.contains full
           if e.attrIsTranslation && !e.attrTargets.any targetMissing then
             items := items.push { tag := .hard, text := e.src ++ "\n" }
         else if e.kind == ``Parser.Command.«set_option» then
@@ -1322,7 +1325,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
           items := items.push { tag := .hard, text := e.src ++ "\n" }
       | .decl =>
         let body := pruneOmit
-          (entryKept env rootPrefix excludedNames activePrefixes boundVars boundVarTypes bound) e
+          (entryKept env isProject excludedNames activePrefixes boundVars boundVarTypes bound) e
         decls := decls ++ e.declNames.filter (!decls.contains ·)
         let s := "\n" ++ body ++ "\n\n"
         -- `open Foo in <decl>` (a `Command.in` node) carries its own `open`, which needs `Foo` to
@@ -1382,14 +1385,15 @@ def declPositions (env : Environment) (source : String) (modDecls : Array Name) 
   return m
 
 /-- The declarations whose auxiliary constants `n`'s statement, or with `includeValue` its value too,
-refers to, `n` excepted: for a constant that is not a declaration (`isDecl`) and is the project's,
+refers to, `n` excepted: for a constant that is not a declaration (`isDecl`) and is the project's
+(`isProject`),
 the declaration whose name is the longest prefix of its name. Lean makes a proof inside a
 declaration a theorem of its own (`foo._proof_1`), and a `match` a definition (`foo.match_1`), and
 reuses one made earlier for the same statement: `bar`'s value may refer to `foo._proof_1`. Elaborated
 again without `foo`, `bar` makes `bar._proof_1`, and its value is no longer the project's. The
 constants found are looked through, in their statements and, for those that are not theorems, their
 values. -/
-def auxiliaryOwners (env : Environment) (rootPrefix : Name) (isDecl : Name → Bool) (n : Name)
+def auxiliaryOwners (env : Environment) (isProject isDecl : Name → Bool) (n : Name)
     (info : ConstantInfo) (includeValue : Bool) : Array Name := Id.run do
   let used (ci : ConstantInfo) (withValue : Bool) : Array Name :=
     ci.type.getUsedConstants ++ (if withValue then
@@ -1400,7 +1404,7 @@ def auxiliaryOwners (env : Environment) (rootPrefix : Name) (isDecl : Name → B
   while !todo.isEmpty do
     let c := todo.back!
     todo := todo.pop
-    if seen.contains c || isDecl c || !isProjectLocalConst env rootPrefix c then continue
+    if seen.contains c || isDecl c || !isProject c then continue
     seen := seen.insert c
     let mut owner := c.getPrefix
     while !owner.isAnonymous && !isDecl owner do owner := owner.getPrefix
@@ -1437,7 +1441,7 @@ def neededDeps (ctx : MeaningGraph.Context) (cache : MeaningGraph.Cache)
       let (source, c) := ctx.sourceDeps cache n info
       cache := c
       let mut deps := deps ++ source
-        ++ auxiliaryOwners ctx.env ctx.rootPrefix ctx.exposed.contains n info !(valueDropped n)
+        ++ auxiliaryOwners ctx.env ctx.isProjectConst ctx.exposed.contains n info !(valueDropped n)
       if valueDropped n then
         let (ofType, c) := MeaningGraph.expandThrough ctx.env (!ctx.isNode ·) cache
           (MeaningGraph.usedConstantsOf ctx.env n info (includeValue := false))
@@ -1542,8 +1546,7 @@ def comparatorConfig (theorems : Array Name) : String :=
   "  \"permitted_axioms\": [\"propext\", \"Quot.sound\", \"Classical.choice\"]\n}\n"
 
 /-- Writes a standalone `<anchorIdOf target>.lean` file into `dir` for each of `targets`, the
-declarations of the project `ctx` was made for (`MeaningGraph.Context.of env rootPrefix`), whose
-source files are under `projectDir`, and beside it `<anchorIdOf target>.json`, Comparator's
+declarations of the project `ctx` was made for, and beside it `<anchorIdOf target>.json`, Comparator's
 configuration for it (`comparatorConfig`), unless Comparator cannot check the file, which is then
 said on the standard error. Targets that are not declarations of the project are skipped. Returns
 the number of files written.
@@ -1552,13 +1555,18 @@ the number of files written.
 (`getOptionDecls` at the start of the process): the options the project is built with are set
 again in the files when they are among these (`isReplayedOption`). Empty, none is.
 
+The project is that of `ctx`: the modules under a root (`MeaningGraph.Context.of env root`), or
+every module but those a file may import (`Context.ofModules env (!(importableModules env
+prefixes).contains ·)`). A module's source is under `projectDir`, or on the source search path
+(`findModuleSource?`).
+
 Each project source file is parsed once. A file then holds its target and, transitively, what each
 declaration in it needs: what `neededDeps` says, the notations its source uses, and the other
 declarations its source command defines. -/
 def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePath)
     (targets : Array Name) (builtinOptions : Std.HashSet Name := {}) : IO Nat := do
   let env := ctx.env
-  let rootPrefix := ctx.rootPrefix
+  let inProject := ctx.inProject
   let exposedNames := ctx.exposed
   -- Exposed notation parsers, by syntax kind; a declaration's source uses one iff its parsed syntax
   -- contains a node of that kind. The kind is the parser's name, both read without the prefix of a
@@ -1591,11 +1599,13 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
   -- Phase 1: process each contributing source file once.
   let mut cache : Std.HashMap Name (Array CommandEntry) := {}
   let mut reparsed : Array Name := #[]
+  let mut noSource : Array Name := #[]
   for modName in moduleOrder do
     let modDecls := declsByModule.getD modName #[]
-    let path := moduleSourcePath projectDir modName
+    let some path ← findModuleSource? projectDir modName
+      | noSource := noSource.push modName; continue
     let some source ← (do try pure (some (← IO.FS.readFile path)) catch _ => pure none)
-      | continue
+      | noSource := noSource.push modName; continue
     let declPos ← declPositions env source modDecls
     -- The source is parsed against the whole project, which holds syntax the module did not
     -- import: a `scoped` notation `ℙ` that the module's `open ProbabilityTheory` activates turns its
@@ -1610,6 +1620,9 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
           reparsed := reparsed.push modName
     let entries ← processFile env source commands declPos notationKinds
     cache := cache.insert modName entries
+  unless noSource.isEmpty do
+    IO.eprintln s!"challenge-gen: no source found for {noSource.size} modules ({noSource[0]!}, …): \
+      their declarations are missing from the files"
   unless reparsed.isEmpty do
     IO.eprintln s!"challenge-gen: {reparsed.size} modules parsed against their own imports \
       ({reparsed[0]!}, …): the project's syntax did not parse them"
@@ -1682,7 +1695,7 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
         unless keep.contains m do
           keep := keep.insert m
           todo := todo.push m
-    let file := assembleTarget env rootPrefix cache moduleOrder exposedNames keep projectNamespaces
+    let file := assembleTarget env inProject cache moduleOrder exposedNames keep projectNamespaces
       moduleOptions projectShortNames target
     IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") file.text
     let (theorems, unmatchable) := theoremsToCheck env file.modules file.decls target

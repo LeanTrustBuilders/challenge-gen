@@ -2,7 +2,7 @@
 
 One Lean file per declaration of a compiled project, which compiles on its own: the declaration and
 everything its text needs, copied from the project's source, with the proofs of theorems replaced by
-`sorry` and imports cut down to what lies outside the project. Such a file is a challenge for
+`sorry` and imports cut down to what lies outside the project, or to the libraries it may import. Such a file is a challenge for
 [Comparator](https://github.com/leanprover/comparator), with the project as the solution: beside
 it, challenge-gen writes Comparator's configuration, which lists the theorems to check.
 
@@ -45,6 +45,12 @@ So does a declaration whose auxiliary theorem or definition it uses: Lean makes 
 The project can be a slice of a library (`--root Mathlib.Probability`): the rest of the library is
 then imported, and a module of the slice that those imports already bring is not copied.
 
+The files can be restricted to some libraries (`--import Mathlib`, repeatable): they then import
+only the modules under those prefixes and the modules these import, and copy what they need of
+every other module, a dependency of the project included. A paper built on another library gets a
+challenge that imports Mathlib alone, as Palomar asks. The sources of the modules copied are found
+under `--src-dir` or on `LEAN_SRC_PATH`, which `lake env` sets.
+
 ## Comparator
 
 Comparator requires every constant that a checked theorem's statement reaches to be the same in the
@@ -70,6 +76,8 @@ lake env challenge-gen --root MyProject --decl MyProject.main_theorem --out chal
 ```
 
 writes `challenges/MyProject___main_theorem.lean` and `challenges/MyProject___main_theorem.json`.
+With `--import Mathlib`, the file imports Mathlib alone and copies what it needs of the project's
+other dependencies.
 Without `--decl`, it writes the files of every declaration of the project. The options are in
 `challenge-gen --help`.
 

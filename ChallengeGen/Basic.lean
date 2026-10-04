@@ -45,6 +45,14 @@ def anchorIdOf (name : Name) : String :=
 def moduleSourcePath (projectDir : System.FilePath) (moduleName : Name) : System.FilePath :=
   projectDir / s!"{moduleName.toString.replace "." "/"}.lean"
 
+/-- The source file of `moduleName`: under `srcDir`, or else where the source search path finds it
+(`LEAN_SRC_PATH`, which `lake env` sets to the source directories of every package). -/
+def findModuleSource? (srcDir : System.FilePath) (moduleName : Name) :
+    IO (Option System.FilePath) := do
+  let path := moduleSourcePath srcDir moduleName
+  if ← path.pathExists then return some path
+  (← getSrcSearchPath).findModuleWithExt "lean" moduleName
+
 /-- The `Core.Context` the extraction runs its `CoreM` and `MetaM` actions in. -/
 def coreContext : Core.Context :=
   { fileName := "<challenge-gen>", fileMap := default, options := {},

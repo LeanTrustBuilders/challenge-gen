@@ -17,7 +17,11 @@ Options:
                        of the project)
   --decls-file <file>  the same, one name per line
   --out <dir>          output directory (default: challenges)
-  --src-dir <dir>      where the project's sources are (default: .)
+  --src-dir <dir>      where the project's sources are (default: .); the sources of other
+                       modules a file copies are found on LEAN_SRC_PATH, which `lake env` sets
+  --import <Prefix>    the files may import the modules under this prefix and every module they
+                       import (repeatable); they copy what they need of every other module.
+                       Default: they import every module outside the root
   --module <Module>    import this module instead of every module under the root (repeatable)
 
 Each file is named after its declaration: `Foo.bar` is written to `Foo___bar.lean`, and beside it
@@ -31,6 +35,7 @@ structure Config where
   out : System.FilePath := "challenges"
   srcDir : System.FilePath := "."
   modules : Array Name := #[]
+  imports : Array Name := #[]
 
 partial def parseArgs (args : List String) (cfg : Config) : IO (Except String Config) :=
   match args with
@@ -44,6 +49,7 @@ partial def parseArgs (args : List String) (cfg : Config) : IO (Except String Co
   | "--out" :: v :: rest => parseArgs rest { cfg with out := v }
   | "--src-dir" :: v :: rest => parseArgs rest { cfg with srcDir := v }
   | "--module" :: v :: rest => parseArgs rest { cfg with modules := cfg.modules.push v.toName }
+  | "--import" :: v :: rest => parseArgs rest { cfg with imports := cfg.imports.push v.toName }
   | a :: _ => return .error s!"unknown argument `{a}`"
 
 /-- The modules of the project rooted at `root` whose source files are under `srcDir`: `root` itself
@@ -81,8 +87,18 @@ unsafe def main (args : List String) : IO UInt32 := do
       if mods.isEmpty then
         throw <| IO.userError s!"no module {cfg.root} under {cfg.srcDir}"
       let env ← importModules (mods.map ({ module := · })) {} (loadExts := true)
-      let ctx := MeaningGraph.Context.of env cfg.root
-      let targets := if cfg.decls.isEmpty then projectDeclarations ctx else cfg.decls
+      -- The project, whose declarations the files copy: the root's modules, or every module but
+      -- those the files may import.
+      let ctx ← if cfg.imports.isEmpty then pure (MeaningGraph.Context.of env cfg.root) else do
+        for p in cfg.imports do
+          unless env.header.moduleNames.any (MeaningGraph.hasPrefixName · p) do
+            throw <| IO.userError s!"no module under {p}, given to --import"
+        let importable := importableModules env cfg.imports
+        pure (MeaningGraph.Context.ofModules env (!importable.contains ·))
+      let underRoot (n : Name) : Bool :=
+        (MeaningGraph.moduleNameOf env n).any (MeaningGraph.hasPrefixName · cfg.root)
+      let targets := if cfg.decls.isEmpty then (projectDeclarations ctx).filter underRoot
+        else cfg.decls
       let unknown := targets.filter (!ctx.exposed.contains ·)
       unless unknown.isEmpty do
         throw <| IO.userError
