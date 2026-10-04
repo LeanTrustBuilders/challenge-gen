@@ -1531,8 +1531,10 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
         -- mentioned where its first replaced proof was: `(have := hk; sorry)`.
         let mentions := e.declNames.foldl (init := #[]) fun acc n =>
           (fixes.mentions.getD n #[]).foldl (fun acc v => if acc.contains v then acc else acc.push v) acc
-        let body := body.replace markedSorry <| if mentions.isEmpty then "sorry"
-          else "(" ++ String.join (mentions.toList.map (s!"have := {·}; ")) ++ "sorry)"
+        let body := if mentions.isEmpty then body.replace markedSorry "sorry" else
+          let restored := String.join (mentions.toList.map (s!"have := {·}; ")) ++ "sorry"
+          -- A proof written `(by tac)` keeps one pair of parentheses.
+          (body.replace s!"({markedSorry})" s!"({restored})").replace markedSorry s!"({restored})"
         if e.altered then altered := altered ++ e.declNames
         let mut s := "\n" ++ body ++ "\n"
         for extra in e.appended do
@@ -1658,30 +1660,53 @@ theorem. Which variables a replaced proof used cannot be read off the source, an
 being used by instance search: the file is elaborated, and its types compared with the project's.
 -/
 
-/-- Elaborates the text of a file, against an environment of `imports`, and returns the environment
-it ends with. Errors are ignored: only the declarations that elaborate are read. -/
-def elabFile (imports : Array Name) (text : String) : IO Environment := do
-  let env ← importWithExtensions ((#[`Init] ++ imports).map ({ module := · }))
-  let inputCtx := Parser.mkInputContext text "<challenge>"
-  let (_, parserState, messages) ← Parser.parseHeader inputCtx
-  let s ← IO.processCommands inputCtx parserState (Command.mkState env messages {})
-  return s.commandState.env
-
-/-- The positions, in the telescope of `project` (a declaration's type in the project), of the
-binders that `file` (its type in an extracted file) lacks, when the binders of `file` are those of
-`project` with some left out; `none` when they do not align so. -/
-partial def missingBinders (project file : Expr) : Option (Array Nat) :=
-  go project file 0 #[]
+/-- A key for each binder of the telescope of `type`, equal for equal binders in two elaborations,
+however many binders precede: a structural hash of the binder's type, where each earlier binder it
+refers to reads as a constant named after that binder's key. The keys of a declaration's type in
+the project and in an extracted file are computed in different processes and compared. -/
+partial def binderKeys (type : Expr) : Array String :=
+  go type #[]
 where
-  go (p f : Expr) (i : Nat) (acc : Array Nat) : Option (Array Nat) :=
-    let x := mkFVar ⟨.num `_challengeGen i⟩
-    match p, f with
-    | .forallE _ pt pb _, .forallE _ ft fb _ =>
-      if pt == ft then go (pb.instantiate1 x) (fb.instantiate1 x) (i + 1) acc
-      else go (pb.instantiate1 x) f (i + 1) (acc.push i)
-    | .forallE _ _ pb _, _ => go (pb.instantiate1 x) f (i + 1) (acc.push i)
-    | _, .forallE .. => none
-    | _, _ => some acc
+  go (e : Expr) (acc : Array String) : Array String :=
+    match e with
+    | .forallE _ d b _ =>
+      let base := toString (hash d)
+      let key := (List.range (acc.size + 1)).map (fun k => if k == 0 then base else s!"{base}_{k}")
+        |>.find? (!acc.contains ·) |>.getD base
+      go (b.instantiate1 (mkConst (.str .anonymous s!"b{key}"))) (acc.push key)
+    | _ => acc
+
+/-- The positions, in the binders of a declaration in the project (`project`, their keys), of those
+its extracted version (`file`) lacks, when the binders of `file` are those of `project` with some
+left out; `none` when they do not align so. -/
+def missingBinders (project file : Array String) : Option (Array Nat) := Id.run do
+  let mut j := 0
+  let mut missing := #[]
+  for i in [0:project.size] do
+    if file[j]? == some project[i]! then j := j + 1 else missing := missing.push i
+  return if j == file.size then some missing else none
+
+/-- Elaborates the text of an extracted file against an environment of its imports, and gives the
+binder keys of each of `decls` (`none` for one that did not elaborate). Run in a process of its own
+(`challenge-gen --binder-keys`): the environment cannot be freed, its extensions being loaded. -/
+def fileBinderKeys (text : String) (decls : Array Name) :
+    IO (Array (Name × Option (Array String))) := do
+  let inputCtx := Parser.mkInputContext text "<challenge>"
+  let (header, parserState, messages) ← Parser.parseHeader inputCtx
+  let imports := Elab.headerToImports header
+  let env ← importWithExtensions imports
+  let s ← IO.processCommands inputCtx parserState (Command.mkState env messages {})
+  let fileEnv := s.commandState.env
+  return decls.map fun n => (n, (fileEnv.find? n).map (binderKeys ·.type))
+
+/-- How `restoreVariables` elaborates a file: given its text and declarations, their binder keys.
+`challenge-gen` runs `fileBinderKeys` in a child process, one file at a time. -/
+abbrev CheckFile := String → Array Name → IO (Std.HashMap Name (Array String))
+
+/-- `fileBinderKeys` in this process: its environments are never freed, so only for a few files. -/
+def checkInProcess : CheckFile := fun text decls => do
+  let keys ← fileBinderKeys text decls
+  return keys.foldl (fun m (n, k?) => match k? with | some k => m.insert n k | none => m) {}
 
 /-- The name and printed type of each binder in the telescope of `type`. -/
 def binderInfos (type : Expr) : MetaM (Array (Name × String)) :=
@@ -1715,17 +1740,20 @@ into theorems only), so each lost variable is mentioned where the declaration's 
 proof was: `(have := hk; sorry)` for a named one, `(have := (inferInstance : BorelSpace E); sorry)`
 for an anonymous instance binder, instance search finding the variable. Repeated until nothing is
 missing, at most three times. A variable that cannot be restored so is reported. -/
-def restoreVariables (env : Environment) (assemble : Fixes → Assembled) : IO String := do
+def restoreVariables (env : Environment) (check : CheckFile) (assemble : Fixes → Assembled) :
+    IO String := do
   let mut fixes : Fixes := {}
   let mut file := assemble fixes
   for _ in [0:3] do
-    if file.altered.isEmpty then break
-    let fileEnv ← elabFile file.imports file.text
+    -- Only the declarations whose project type the file can be compared with.
+    let altered := file.altered.filter (env.contains ·)
+    if altered.isEmpty then break
+    let fileKeys ← check file.text altered
     let mut changed := false
-    for n in file.altered do
+    for n in altered do
       let some p := env.find? n | continue
-      let some f := fileEnv.find? n | continue
-      let some missing := missingBinders p.type f.type | continue
+      let some f := fileKeys.get? n | continue
+      let some missing := missingBinders (binderKeys p.type) f | continue
       if missing.isEmpty then continue
       let binders ← runMetaIO env (binderInfos p.type)
       for i in missing do
@@ -1757,6 +1785,10 @@ declarations of the project `ctx` was made for (`MeaningGraph.Context.of env roo
 source files are under `projectDir`. Targets that are not declarations of the project are skipped.
 Returns the number of files written.
 
+`check` elaborates a file to restore the section variables its declarations lost
+(`restoreVariables`); the default does it in this process, whose memory then grows with each file
+checked, and `challenge-gen` does it in a child process instead.
+
 `builtinOptions` are Lean's own options, those registered before any module was imported
 (`getOptionDecls` at the start of the process): the options the project is built with are set
 again in the files when they are among these (`isReplayedOption`). Empty, none is.
@@ -1765,7 +1797,8 @@ Each project source file is parsed once. A file then holds its target and, trans
 declaration in it needs: what `neededDeps` says, the notations its source uses, and the other
 declarations its source command defines. -/
 def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePath)
-    (targets : Array Name) (builtinOptions : Std.HashSet Name := {}) : IO Nat := do
+    (targets : Array Name) (builtinOptions : Std.HashSet Name := {})
+    (check : CheckFile := checkInProcess) : IO Nat := do
   let env := ctx.env
   let rootPrefix := ctx.rootPrefix
   let exposedNames := ctx.exposed
@@ -1893,7 +1926,7 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
           todo := todo.push m
     let assemble := fun fixes => assembleTarget env rootPrefix cache moduleOrder exposedNames keep
       projectNamespaces moduleOptions projectShortNames target fixes
-    let content ← restoreVariables env assemble
+    let content ← restoreVariables env check assemble
     IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") content
   return targets.size
 
