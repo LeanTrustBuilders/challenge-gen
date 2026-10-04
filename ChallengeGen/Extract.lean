@@ -23,16 +23,28 @@ written, so the output is readable.
 2. Classify each command as a *declaration* (it defines a declaration of the project), a *context*
    command (`namespace`/`end`/`open`/`variable`/`section`/`set_option`/`universe`), or *skip*.
 3. Extract each command's source text by byte position. For theorems, the proof body (`declVal`) is
-   replaced by `:= sorry` surgically (the rest of the source is untouched).
+   replaced by `:= sorry` surgically (the rest of the source is untouched). Every other declaration
+   is copied whole, the proofs inside it included.
 4. Close each target under what its text needs: `MeaningGraph`'s statement dependencies for a
    declaration whose proof became `sorry`, its term dependencies for one kept whole, and in both
    cases its source dependencies, the notations its source uses and its command's siblings.
 5. Per target, keep the context commands plus the declaration commands in that closure, drop
-   now-empty sections, and assemble: external `import`s followed by the bodies in module-dependency
-   order.
+   now-empty sections, and assemble a module: external `public import`s followed by the bodies in
+   module-dependency order, each in a section where it has the visibility it has in the project.
+6. List the theorems of the file, which Comparator is to check (`theoremsToCheck`).
 
 Each source file is processed **once** and cached; assembling a target then only filters and
 concatenates strings.
+
+## Comparator
+
+A file is meant as Comparator's challenge, the project as the solution. Comparator requires every
+constant a checked theorem's statement reaches to be identical in both, values included, except the
+theorems it is told to check: those it compares by statement, and their proofs must use no axiom
+but the permitted ones. So the only `sorry` a file holds is a theorem's proof, and every theorem
+Comparator reaches is to be checked. A definition is copied with the proofs inside it, which must
+elaborate in the file; the theorems Lean makes of those proofs (`foo._proof_1`) are checked too, so
+that the file's proof need not be the project's.
 -/
 
 open Lean Lean.Elab Lean.Elab.Command Lean.Parser
@@ -63,13 +75,6 @@ structure CommandEntry where
   /-- For a declaration command, whether its value is replaced by `sorry`: a proof with a value.
   What it needs is then what its statement needs (see `neededDeps`). -/
   valueDropped : Bool := false
-  /-- For a declaration command kept whole, whether its text was changed: a proof inside its value
-  or a field's default replaced by `sorry`, or a `deriving` clause by instances. Lean decides which
-  section variables a definition takes from its value, so such a declaration may take fewer than
-  the project's: `restoreVariables` checks. -/
-  altered : Bool := false
-  /-- For a `section` command, the command as replayed (`replayedSection`). -/
-  sectionSrc? : Option String := none
   /-- For a `namespace`, `section` or `end` command, how many scopes it opens or closes: one per
   component of its name, one for an anonymous `section` or `end`. -/
   scopes : Nat := 1
@@ -104,9 +109,6 @@ structure CommandEntry where
   /-- True when such a command applies a *translation* attribute (`to_additive`/`to_dual`). Only
   these are replayed; see `isContextCmd`. -/
   attrIsTranslation : Bool := false
-  /-- Extra commands to emit right after this one — used for `instance … := sorry` replacements of a
-  definition's `deriving` clause (which can't be re-derived in the minimal file). -/
-  appended : Array String := #[]
   /-- For a declaration command, the exposed notation parsers whose syntax appears in its source. The
   notation's expansion (not the parser) is what shows up in the elaborated term, so this syntactic
   signal is the only way to know the verbatim source needs that notation command replayed. -/
@@ -202,84 +204,6 @@ def isTheoremDecl (stx : Syntax) : Bool := containsSyntaxKind stx theoremSyntaxK
 begins with either `structureTk` or `classTk`). -/
 def isStructureDecl (stx : Syntax) : Bool := containsSyntaxKind stx structureSyntaxKinds
 
-/-- The byte ranges of the outermost `by …` tactic blocks inside `root` (not recursing into a block
-already collected). Used to replace embedded proofs in a *definition's* value with `sorry`. -/
-partial def collectByBlocks (root : Syntax) : Array (String.Pos.Raw × String.Pos.Raw) := Id.run do
-  let mut acc : Array (String.Pos.Raw × String.Pos.Raw) := #[]
-  let mut worklist : Array Syntax := #[root]
-  while !worklist.isEmpty do
-    let stx := worklist.back!
-    worklist := worklist.pop
-    if stx.getKind == ``Lean.Parser.Term.byTactic then
-      match stx.getPos?, stx.getTailPos? with
-      | some s, some e => acc := acc.push (s, e)   -- don't descend into a block we'll replace
-      | _, _ => for arg in stx.getArgs do worklist := worklist.push arg
-    else if !isQuotation stx then
-      for arg in stx.getArgs do
-        worklist := worklist.push arg
-  return acc
-
-/-- The byte ranges of `by …` blocks that constitute the *entire* value of something — either a
-definition's value (`def f … := by tac`) or one structure-instance field (`… where fld := by tac`,
-and the `{ fld := by tac }` spelling). Such a block is a direct child of `declValSimple` or of
-`Term.structInstFieldDef`; a proof embedded inside a larger term sits deeper.
-
-These must be kept rather than replaced by `sorry`, because for a **definition** Lean decides which
-section `variable`s to include from what the value actually mentions, and `sorry` mentions nothing.
-Both shapes were observed losing binders and so silently changing a signature:
-
-* `def leftLimWithin (f : α → β) (s : Set α) (a : α) : β := by classical …` under
-  `variable {α β : Type*} [LinearOrder α] [TopologicalSpace β]` dropped both instances, breaking
-  every use site that passes them positionally (`@leftLimWithin αᵒᵈ β _ _ f s a`);
-* `def ofSeq : MartDiffArray P where … mgdiff n i := by …` dropped the `hmgdiff` binder, so
-  `ofSeq` shed an argument and every call misaligned.
-
-Sparing only these two shapes is deliberate. Keeping *every* tactic block in a definition was
-measured and is far worse: it takes brownian-motion from 2 failures to 71, because a proof embedded
-in a larger term generally cannot run in the minimal file, which does not replay the `@[simp]` /
-`@[measurability]` registrations it depends on. -/
-partial def wholeValueTacticRanges (root : Syntax) : Array (String.Pos.Raw × String.Pos.Raw) :=
-  Id.run do
-  let mut acc : Array (String.Pos.Raw × String.Pos.Raw) := #[]
-  let mut worklist : Array Syntax := #[root]
-  while !worklist.isEmpty do
-    let stx := worklist.back!
-    worklist := worklist.pop
-    let k := stx.getKind
-    if k == ``Parser.Command.declValSimple || k == ``Lean.Parser.Term.structInstFieldDef then
-      for a in stx.getArgs do
-        if a.getKind == ``Lean.Parser.Term.byTactic then
-          match a.getPos?, a.getTailPos? with
-          | some s, some e => acc := acc.push (s, e)
-          | _, _ => pure ()
-    unless isQuotation stx do
-      for a in stx.getArgs do
-        worklist := worklist.push a
-  return acc
-
-/-- The byte ranges of the `binderTactic` nodes inside `root`, i.e. binder/field defaults written
-`:= by tac`.
-
-A default is **not** a `Term.byTactic` node, so a walk looking for those never finds it. Its parser
-is `atomic (symbol " := " >> " by ") >> tacticSeq`, meaning the node's range covers the ` := by `
-prefix as well as the tactic block — a replacement
-therefore has to supply the `:=` itself. -/
-partial def collectBinderTactics (root : Syntax) : Array (String.Pos.Raw × String.Pos.Raw) :=
-  Id.run do
-  let mut acc : Array (String.Pos.Raw × String.Pos.Raw) := #[]
-  let mut worklist : Array Syntax := #[root]
-  while !worklist.isEmpty do
-    let stx := worklist.back!
-    worklist := worklist.pop
-    if stx.getKind == ``Lean.Parser.Term.binderTactic then
-      match stx.getPos?, stx.getTailPos? with
-      | some s, some e => acc := acc.push (s, e)   -- don't descend into a block we'll replace
-      | _, _ => for arg in stx.getArgs do worklist := worklist.push arg
-    else if !isQuotation stx then
-      for arg in stx.getArgs do
-        worklist := worklist.push arg
-  return acc
-
 /-- Every `SyntaxNodeKind` occurring anywhere in `stx` (including `stx` itself). A notation use shows
 up here as a node whose kind is the notation parser's name. Quotations are entered, unlike in the
 other walks: a quotation's text is parsed with the notations it uses. -/
@@ -317,11 +241,6 @@ def isContextCmd (stx : Syntax) : Bool :=
     || k == ``Parser.Command.«attribute»
     || isNotationCmd k
 
-/-- The `sorry` replacing the first proof in a declaration's value, marked (by a character of a
-private use area, which no source contains) as the place where `restoreVariables` may mention the
-variables that proof used. `assembleTarget` removes the mark. -/
-def markedSorry : String := "sorry\uE000"
-
 /-- The substring of `source` between two byte positions. -/
 def slice (source : String) (s e : String.Pos.Raw) : String :=
   ({ str := source, startPos := s, stopPos := e } : Substring.Raw).toString
@@ -334,14 +253,6 @@ def nameAt (ns n : Name) : String :=
   if ns.isAnonymous then n.toString
   else if ns.isPrefixOf n && n != ns then (n.replacePrefix ns .anonymous).toString
   else "_root_." ++ n.toString
-
-/-- The instance among `names` whose class is `cls`, as written after `deriving`: matched on the last
-component of the class at the head of its type. -/
-def derivedInstance? (env : Environment) (names : Array Name) (cls : String) : Option Name :=
-  let last := (cls.trimAscii.toString.toName).getString!
-  names.find? fun n =>
-    Meta.isInstanceCore env n &&
-      ((env.find? n).bind (·.type.getForallBody.getAppFn.constName?)).any (·.getString! == last)
 
 /-- For an `instance` written without a name, the edit inserting the name the project gave it.
 
@@ -362,22 +273,6 @@ def instanceNameEdit? (env : Environment) (ns : Name) (stx : Syntax) (names : Ar
 partial def findFirstIdent? (stx : Syntax) : Option Syntax :=
   if stx.isIdent then some stx else stx.getArgs.findSome? findFirstIdent?
 
-/-- A `section` command as it is replayed: `noncomputable` and the section's name kept, the module
-system's `@[expose]`, `public` and `meta` dropped, since an extracted file is not a module.
-
-`noncomputable` has to stay: a definition relying on it (`Classical.choice`, real division) does
-not compile without it. The header is read from the source text before the `section` keyword, the
-name from the parsed syntax (`sectionHeader "section" (ident)?`). -/
-def replayedSection (source : String) (stx : Syntax) : String :=
-  let header := match stx.getPos?, stx[1].getPos? with
-    | some s, some e => slice source s e
-    | _, _ => ""
-  let noncomputable_ := (header.splitOn "noncomputable").length > 1
-  let name := match stx[2].getOptional? with
-    | some id => s!" {id.getId}"
-    | none => ""
-  (if noncomputable_ then "noncomputable " else "") ++ "section" ++ name
-
 /-- The source `[cmdStart, cmdEnd)` with each edit applied: `(s, e, repl)` replaces the byte range
 `[s, e)` with `repl`; a zero-width range (`s == e`) is an insertion. Edits must be non-overlapping. -/
 def applyEdits (source : String) (cmdStart cmdEnd : String.Pos.Raw)
@@ -390,62 +285,6 @@ def applyEdits (source : String) (cmdStart cmdEnd : String.Pos.Raw)
     out := out ++ slice source cursor s ++ repl
     cursor := e
   return out ++ slice source cursor cmdEnd
-
-/-- Information needed to replace a definition's `deriving …` clause with `sorry` instances:
-the byte position where the `deriving` keyword starts (everything from here is dropped), and the
-generated `instance … := sorry` commands (one per derived class). Returns `none` if the command has
-no `deriving` clause or its shape can't be reconstructed (in which case it is left verbatim). -/
-def derivingReplacement? (source : String) (stx : Syntax) (cmdEnd : String.Pos.Raw)
-    (nameOf : String → String := fun _ => "") : Option (String.Pos.Raw × Array String) := Id.run do
-  -- Only `def` deriving causes the delta-derivation failures; structures derive fine.
-  let some defNode := findFirstOfKind? stx ``Parser.Command.definition | return none
-  -- The `deriving` keyword atom inside the definition.
-  let some derivingAtom := Id.run (do
-    let mut wl : Array Syntax := #[defNode]
-    while !wl.isEmpty do
-      let s := wl.back!; wl := wl.pop
-      match s with
-      | .atom _ "deriving" => return some s
-      | _ => unless isQuotation s do for a in s.getArgs do wl := wl.push a
-    return none) | return none
-  let some dpos := derivingAtom.getPos? | return none
-  let some dtail := derivingAtom.getTailPos? | return none
-  -- Class names: the text after `deriving`, comma-separated.
-  let classes := (slice source dtail cmdEnd).splitOn "," |>.filterMap (fun c =>
-    let c := c.trimAscii.toString
-    if c.isEmpty then none else some c)
-  if classes.isEmpty then return none
-  -- The declaration name and its binders.
-  let some declId := findFirstOfKind? defNode ``Parser.Command.declId | return none
-  let some idPos := declId.getPos? | return none
-  let some idTail := declId.getTailPos? | return none
-  let defName := slice source idPos idTail
-  let some sig := findFirstOfKind? defNode ``Parser.Command.optDeclSig | return none
-  let binderNodes := if sig.getArgs.size ≥ 1 then sig[0].getArgs else #[]
-  let mut bindersText := ""
-  let mut applyNames : Array String := #[]
-  for b in binderNodes do
-    match b.getPos?, b.getTailPos? with
-    | some s, some e =>
-      let btxt := slice source s e
-      bindersText := if bindersText.isEmpty then btxt else bindersText ++ " " ++ btxt
-      -- Explicit binders (and bare `binderIdent`s) are applied positionally; the rest are inferred.
-      if b.getKind == ``Lean.Parser.Term.explicitBinder then
-        let before := ((btxt.splitOn ":").headD btxt).replace "(" " " |>.replace ")" " "
-        for nm in before.splitOn " " do
-          let nm := nm.trimAscii.toString
-          unless nm.isEmpty do applyNames := applyNames.push nm
-      else if b.isIdent then
-        applyNames := applyNames.push b.getId.toString
-    | _, _ => return none
-  let app := " ".intercalate (defName :: applyNames.toList)
-  let bindersClause := if bindersText.isEmpty then "" else " " ++ bindersText
-  -- Each instance is named as the deriving handler named it (`nameOf`), since Lean would name an
-  -- unnamed one otherwise.
-  let instances := classes.map fun c =>
-    let name := nameOf c
-    s!"instance{if name.isEmpty then "" else " " ++ name}{bindersClause} : {c} ({app}) := sorry"
-  return some (dpos, instances.toArray)
 
 /-- Every identifier appearing anywhere in `stx`, as strings.
 
@@ -532,7 +371,8 @@ Two cases:
   the `@[refl]` lemma of the relation in the statement (for `f ≡ᵐ[μ] g`, that is
   `Indistinguishable.refl`). Since that dependency runs through an attribute rather than through any
   term, it is invisible to the dependency analysis and the lemma is not in the closure. Registering
-  the lemma for the `ext` tactic is of no use in a file whose proofs are all `sorry`.
+  the lemma for the `ext` tactic would serve only the proofs inside definitions, the only proofs the
+  file runs.
 * The `annotationAttributes`: their only effect is to record something for a reading tool to pick
   back out, which says nothing in a one-declaration file — a characterization's parts are separate
   declarations, so an extraction of any one of them has at most a part of the claim. Dropping them
@@ -634,10 +474,10 @@ teaches `to_dual` the `MeasurableSup₂ ↦ MeasurableInf₂` pairing; without i
 commands translate that class to itself and emit an ill-typed statement.
 
 Only these are replayed. Other standalone `attribute` commands (`@[simp]`, `@[fun_prop]`,
-`@[measurability]`, …) affect *proof* elaboration, which is moot in a file whose proofs are all
-`sorry`, and replaying them was measured to be actively harmful: pulling in the module that carries
-them made every brownian-motion target include declarations it did not need, taking that corpus
-from 2 failures to 1623. -/
+`@[measurability]`, …) affect *proof* elaboration, in the file that of the proofs inside
+definitions only, and replaying them was measured to be actively harmful: pulling in the module
+that carries them made every brownian-motion target include declarations it did not need, taking
+that corpus from 2 failures to 1623. -/
 def translationAttributes : List String := ["to_additive", "to_dual"]
 
 /-- For a standalone `attribute [attrs] a b c` command, the attributes as written and the names they
@@ -723,17 +563,11 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- variables it takes from its statement alone, so this cannot change its signature. Not an
       -- `instance` of a `Prop`-valued class, although it is a theorem too: an instance takes the
       -- variables its value uses, like a definition, and with its value replaced it would lose
-      -- those only its proof uses (`[BorelSpace E]` in an `IsGaussian` instance did).
+      -- those only its proof uses (`[BorelSpace E]` in an `IsGaussian` instance did). Every other
+      -- declaration is copied whole, the proofs inside it, a field's tactic default and a
+      -- `deriving` clause included: Comparator requires a definition to be the project's, value
+      -- included, and a definition takes the variables its value uses.
       let isProof := isTheoremDecl stx
-      -- Proofs: replace the whole value with `sorry`. Definitions: keep the value verbatim but
-      -- replace any embedded `by …` tactic proofs in it with `sorry`, and turn a `deriving` clause
-      -- into standalone `instance … := sorry` (it can't be delta-derived in the minimal file).
-      let (declEnd, appended) :=
-        if isProof then (cmdEnd, #[])
-        else match derivingReplacement? source stx cmdEnd fun c =>
-            (derivedInstance? env names c).map (nameAt nsPrefixStack.back!) |>.getD "" with
-          | some (dpos, instances) => (dpos, instances)
-          | none => (cmdEnd, #[])
       -- Attributes whose elaboration reaches outside this file are dropped from every declaration
       -- command, theorem or not (see `isDroppedAttribute`), as is any `set_option … in` prefix
       -- naming an option the extracted file's imports no longer register (see `excludedOptions`).
@@ -744,49 +578,12 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
       -- `pruneOmit` can re-render the prefix per target. Edits before `start` are irrelevant to
       -- that slice and are dropped, since `applyEdits` reads its edits in position order.
-      -- The edits inside the value of a declaration kept whole.
-      let valueEdits : Array (String.Pos.Raw × String.Pos.Raw × String) :=
-        if isProof then #[]
-        else if isStructureDecl stx then
-          -- A structure/class field's default value (`field : T := by tac`) is a
-          -- `Term.binderTactic` in the `structFields` node — neither a `Term.byTactic` nor part of
-          -- any `declVal`, so the scan below never sees it and the tactic is emitted verbatim. It
-          -- then has to run inside the minimal file, where the lemma sets it relies on
-          -- (`measurability`, `fun_prop`, …) are not populated, and every construction of the
-          -- structure that omits the field fails with "could not synthesize default value for
-          -- field". `binderTactic` spans its own ` := by `, so the replacement has to restore the
-          -- `:=`. Only in the fields: a `:= by tac` default among the structure's parameters is an
-          -- `autoParam` of its type, which `sorry` would change (`IsBrownianReal X` would mean "for
-          -- the measure `sorry`").
-          ((findFirstOfKind? stx ``Parser.Command.structFields).map collectBinderTactics
-            |>.getD #[]).map fun (bs, be) => (bs, be, ":= sorry")
-        else
-          let byBlocks := match findDeclValStx? stx with
-            | some v => collectByBlocks v
-            | none => #[]
-          -- Keep the blocks that *are* a value rather than sitting inside one: replacing those
-          -- would drop the `variable` binders the body mentions and change the declaration's
-          -- signature. See `wholeValueTacticRanges`.
-          let spared := wholeValueTacticRanges stx
-          let byBlocks := byBlocks.filter fun (r : String.Pos.Raw × String.Pos.Raw) =>
-            !spared.any fun (s : String.Pos.Raw × String.Pos.Raw) =>
-              s.1.byteIdx == r.1.byteIdx && s.2.byteIdx == r.2.byteIdx
-          let first := byBlocks.foldl (fun m (r : String.Pos.Raw × String.Pos.Raw) =>
-            min m r.1.byteIdx) source.utf8ByteSize
-          byBlocks.map fun (bs, be) => (bs, be, if bs.byteIdx == first then markedSorry else "sorry")
-      -- Renders the command from `start`, which is either the command's own start or — for a
-      -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
-      -- `pruneOmit` can re-render the prefix per target. Edits before `start` are irrelevant to
-      -- that slice and are dropped, since `applyEdits` reads its edits in position order.
       let mkSrc (start : String.Pos.Raw) : String :=
         let prefixEdits := prefixEdits.filter fun (r : String.Pos.Raw × String.Pos.Raw × String) =>
           r.1.byteIdx ≥ start.byteIdx
-        if isProof then
-          match findDeclVal? stx with
-          | some (valStart, _) => applyEdits source start valStart prefixEdits ++ ":= sorry"
-          | none => applyEdits source start cmdEnd prefixEdits
-        else
-          applyEdits source start declEnd (prefixEdits ++ valueEdits)
+        match isProof, findDeclVal? stx with
+        | true, some (valStart, _) => applyEdits source start valStart prefixEdits ++ ":= sorry"
+        | _, _ => applyEdits source start cmdEnd prefixEdits
       let src := mkSrc cmdStart
       let (omitBinders, srcNoOmit?) :=
         match decomposeOmit? source stx with
@@ -795,17 +592,14 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       let usedNotations := (collectSyntaxKinds stx).toArray.filterMap fun k =>
         notationKinds.get? (privateToUserName k)
       let valueDropped := isProof && (findDeclVal? stx).isSome
-      let altered := !valueEdits.isEmpty || !appended.isEmpty
       entries := entries.push
-        { cls := .decl, src, kind := stx.getKind, declNames := names, valueDropped, altered,
-          appended, usedNotations, omitBinders, srcNoOmit? }
+        { cls := .decl, src, kind := stx.getKind, declNames := names, valueDropped, usedNotations,
+          omitBinders, srcNoOmit? }
     else if isContextCmd stx then
       let kind := stx.getKind
       let nsName? := if kind == ``Parser.Command.namespace && stx.getArgs.size ≥ 2 then
         some stx[1].getId else none
       let qualifiedNsName? := nsName?.map (nsPrefixStack.back! ++ ·)
-      let sectionSrc? := if kind == ``Parser.Command.«section» && stx.getArgs.size ≥ 3 then
-        some (replayedSection source stx) else none
       -- The name a `namespace`, `section` or `end` command carries: one scope per component.
       let scopeName : Name :=
         if let some ns := nsName? then ns
@@ -846,7 +640,7 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
         | some (attrs, targets) => (targets, attrs.any isTranslationAttribute)
         | none => (#[], false)
       entries := entries.push
-        { cls := .context, src := slice source cmdStart cmdEnd, kind, sectionSrc?, scopes, nsName?,
+        { cls := .context, src := slice source cmdStart cmdEnd, kind, scopes, nsName?,
           qualifiedNsName?, binders, openOnlyNamespace?, openOnlyIdents, attrTargets,
           attrIsTranslation }
     else
@@ -927,37 +721,39 @@ def truncateAfterTarget (involved : Array (Name × Array CommandEntry)) (target 
 
 /-! ## Phase 3: assembly -/
 
-/-- The external (non-project) modules to `import` for `modules`. Because project modules are emitted
+/-- The external (non-project) modules to import for `modules`. Because project modules are emitted
 inline rather than imported, an external (e.g. Mathlib) dependency may only be reachable *through* a
 project module. So we walk the import graph transitively through project modules, collecting the
 external "frontier" — every external module directly imported by any project module reachable from
 `modules`, less the `excludedImports`. `public import`ing those covers their transitive
-dependencies. -/
+dependencies. A module the project imports with `meta`, for the code it runs while elaborating
+(`public meta import`), is imported so again. -/
 partial def externalImports (env : Environment) (rootPrefix : Name) (modules : Array Name) :
-    Array Name := Id.run do
-  let directImports (modName : Name) : Array Name := Id.run do
+    Array Import := Id.run do
+  let directImports (modName : Name) : Array Import := Id.run do
     let some idx := env.getModuleIdx? modName | return #[]
     if h : idx.toNat < env.header.moduleData.size then
-      return env.header.moduleData[idx.toNat].imports.map (·.module)
+      return env.header.moduleData[idx.toNat].imports
     return #[]
-  let mut visited : Std.HashSet Name := {}     -- project modules already walked
-  let mut seenExt : Std.HashSet Name := {}     -- external modules already collected
-  let mut result : Array Name := #[]
+  let mut visited : Std.HashSet Name := {}            -- project modules already walked
+  let mut seenExt : Std.HashSet (Name × Bool) := {}   -- external imports already collected
+  let mut result : Array Import := #[]
   let mut stack := modules.toList
   while !stack.isEmpty do
     let modName := stack.head!
     stack := stack.tail!
     if visited.contains modName then continue
     visited := visited.insert modName
-    for m in directImports modName do
+    for i in directImports modName do
+      let m := i.module
       if m == `Init then continue
       if hasPrefixName m rootPrefix then
         stack := m :: stack            -- project module: recurse into its imports
       else if isExcludedImport m then
         continue                       -- external, but deliberately not imported (see above)
-      else if !seenExt.contains m then
-        seenExt := seenExt.insert m    -- external module: part of the import frontier
-        result := result.push m
+      else if !seenExt.contains (m, i.isMeta) then
+        seenExt := seenExt.insert (m, i.isMeta)   -- external module: part of the import frontier
+        result := result.push { module := m, isMeta := i.isMeta }
   return result
 
 /-- Every module that `mods` import, directly or not, `mods` excluded. -/
@@ -1317,22 +1113,11 @@ def openedNamespaces (known : Std.HashSet Name) (prefixes : Array Name)
     if let some ns := resolved? then acc := acc.push ns
   return acc
 
-/-- Changes to a file restoring the section variables its altered declarations lost
-(`restoreVariables`): for a declaration, the terms its first replaced proof mentions, a variable's
-name or `(inferInstance : C)` for an anonymous instance binder. -/
-structure Fixes where
-  mentions : Std.HashMap Name (Array String) := {}
-  deriving Inhabited
-
-/-- A file as `assembleTarget` writes it, with what `restoreVariables` reads of it. -/
+/-- A file as `assembleTarget` writes it. -/
 structure Assembled where
   text : String
-  /-- The modules it imports. -/
-  imports : Array Name
-  /-- The declarations of its altered commands (`CommandEntry.altered`). -/
-  altered : Array Name
-  /-- The binders of its `variable` commands, as written. -/
-  variableBinders : Array String
+  /-- The project's declarations it declares, in the order it declares them. -/
+  decls : Array Name
 
 /-- Assembles the standalone file for `target`. `cache` holds the processed entries per module;
 `moduleOrder` lists the project modules in dependency-first order; `keep` is the target's transitive
@@ -1341,7 +1126,7 @@ to declarations *outside* `keep`). -/
 def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap Name (Array CommandEntry))
     (moduleOrder : Array Name) (exposedNames keep projectNamespaces : Std.HashSet Name)
     (moduleOptions : Std.HashMap Name (Array (Name × String))) (projectShortNames : Std.HashSet String)
-    (target : Name) (fixes : Fixes := {}) : Assembled := Id.run do
+    (target : Name) : Assembled := Id.run do
   -- Modules contributing at least one kept declaration, in dependency order, with their filtered
   -- (and section-stripped) entries.
   let mut involved : Array (Name × Array CommandEntry) := #[]
@@ -1371,7 +1156,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- declared twice. It is left out. The target's own module never is: a module importing it comes
   -- after it, and declares nothing this file needs.
   let imports := externalImports env rootPrefix (involved.map (·.1))
-  let imported := importClosure env imports
+  let imported := importClosure env (imports.map (·.module))
   let targetModule := involved.findSome? fun (m, entries) =>
     if entries.any (fun e => e.cls == .decl && e.declNames.contains target) then some m else none
   involved := involved.filter fun (m, _) => !imported.contains m || targetModule == some m
@@ -1428,8 +1213,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
   -- entered (`namespace`) or opened (`open`) namespace. Accumulated (never popped) as an
   -- over-approximation of scope; `entryKept` only matches exact excluded names against it.
   let mut activePrefixes : Array Name := #[Name.anonymous]
-  let mut altered : Array Name := #[]
-  let mut variableBinders : Array String := #[]
+  let mut decls : Array Name := #[]
   -- The names bound by the `variable` binders kept so far, which `include` and `omit` may name.
   let mut bound : Std.HashSet Name := {}
   for (modName, entries) in involved do
@@ -1448,7 +1232,12 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     -- and repeating the same `open Foo` several times can make an unqualified name reachable
     -- through several redundant open-paths to the same declaration, which Lean then reports as
     -- ambiguous even though every path resolves to the exact same constant.
-    items := items.push { tag := .openSection, text := "section\n" }
+    -- A module of the project keeps the visibility its own `section`s give its declarations; the
+    -- declarations of a file that is not a module are all public, with their values exposed.
+    let isModule := (env.getModuleIdx? modName).bind (env.header.moduleData[·.toNat]?)
+      |>.any (·.isModule)
+    items := items.push
+      { tag := .openSection, text := if isModule then "section\n" else "@[expose] public section\n" }
     -- The options this module is built with that the file does not set at its top.
     for o in moduleOptions.getD modName #[] do
       unless common.contains o do
@@ -1461,8 +1250,6 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
           for (bsrc, idents) in e.binders do
             if entryOk (bsrc, idents) then
               bound := (binderBoundNames bsrc).foldl (·.insert ·.toName) bound
-          for (bsrc, idents) in e.binders do
-            if entryOk (bsrc, idents) then variableBinders := variableBinders.push bsrc
           if let some v := pruneEntries entryOk "variable" e then
             items := items.push { tag := .soft, text := v ++ "\n" }
         else if e.kind == ``Parser.Command.«include» || e.kind == ``Parser.Command.«omit» then
@@ -1479,10 +1266,9 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
             { tag := .openNamespace, text := e.src ++ "\n", scopes := e.scopes
               namespaces := e.qualifiedNsName?.toArray }
         else if e.kind == ``Parser.Command.«section» then
-          -- Every form of `section`, the module system's `@[expose] public section` included, as
-          -- `replayedSection` renders it. An empty one goes in `stripEmptyScopes`.
-          items := items.push
-            { tag := .openSection, text := e.sectionSrc?.getD e.src ++ "\n", scopes := e.scopes }
+          -- Every form of `section` as written, the module system's `@[expose] public section`
+          -- included. An empty one goes in `stripEmptyScopes`.
+          items := items.push { tag := .openSection, text := e.src ++ "\n", scopes := e.scopes }
         else if e.kind == ``Parser.Command.«end» then
           items := items.push { tag := .close, text := e.src ++ "\n", scopes := e.scopes }
         else if e.kind == ``Parser.Command.«attribute» then
@@ -1527,19 +1313,8 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
       | .decl =>
         let body := pruneOmit
           (entryKept env rootPrefix excludedNames activePrefixes boundVars boundVarTypes bound) e
-        -- The variables its altered text no longer uses but the project's declaration takes are
-        -- mentioned where its first replaced proof was: `(have := hk; sorry)`.
-        let mentions := e.declNames.foldl (init := #[]) fun acc n =>
-          (fixes.mentions.getD n #[]).foldl (fun acc v => if acc.contains v then acc else acc.push v) acc
-        let body := if mentions.isEmpty then body.replace markedSorry "sorry" else
-          let restored := String.join (mentions.toList.map (s!"have := {·}; ")) ++ "sorry"
-          -- A proof written `(by tac)` keeps one pair of parentheses.
-          (body.replace s!"({markedSorry})" s!"({restored})").replace markedSorry s!"({restored})"
-        if e.altered then altered := altered ++ e.declNames
-        let mut s := "\n" ++ body ++ "\n"
-        for extra in e.appended do
-          s := s ++ extra ++ "\n"
-        s := s ++ "\n"
+        decls := decls ++ e.declNames.filter (!decls.contains ·)
+        let s := "\n" ++ body ++ "\n\n"
         -- `open Foo in <decl>` (a `Command.in` node) carries its own `open`, which needs `Foo` to
         -- exist just as a standalone one does. Only the first line is scanned: that is where the
         -- prefix sits, and scanning the whole declaration would match every fully-qualified name
@@ -1556,11 +1331,10 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     (common.foldl (fun m (o, v) => m.insert o v) {})
   let body := String.join (kept.toList.map (·.text))
   let nsStubs := chunkNamespaces kept
-  -- The extracted files are terminal and self-contained (nothing imports them), so the source's
-  -- module-system scaffolding (`module` header, `public import`, `@[expose] public section`) is
-  -- unnecessary: plain `import`s suffice, and the sections are replayed without it
-  -- (`replayedSection`).
-  let mut out := String.join (imports.toList.map (fun i => s!"import {i}\n"))
+  -- A module, as Comparator's challenge must be on Palomar, its imports public. Each project module's
+  -- text sits in a section of its own, where it has the visibility it has in the project.
+  let mut out := "module\n\n" ++ String.join (imports.toList.map fun i =>
+    s!"public {if i.isMeta then "meta " else ""}import {i.module}\n")
   out := out ++ s!"\n/-! # Standalone extraction for `{target}`\n"
     ++ "Definitions are copied verbatim; theorem proofs are replaced by `sorry`.\n"
     ++ "Auto-generated by ChallengeGen. -/\n"
@@ -1579,8 +1353,7 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for ns in nsStubs do
       out := out ++ s!"namespace {ns}\nend {ns}\n"
   out := out ++ body
-  return { text := (collapseBlankRuns out).trimAscii.toString ++ "\n", imports, altered,
-           variableBinders }
+  return { text := (collapseBlankRuns out).trimAscii.toString ++ "\n", decls }
 
 /-! ## Driver -/
 
@@ -1597,17 +1370,45 @@ def declPositions (env : Environment) (source : String) (modDecls : Array Name) 
       m := m.insert pos ((m.getD pos #[]).push name)
   return m
 
+/-- The declarations whose auxiliary constants `n`'s statement, or with `includeValue` its value too,
+refers to, `n` excepted: for a constant that is not a declaration (`isDecl`) and is the project's,
+the declaration whose name is the longest prefix of its name. Lean makes a proof inside a
+declaration a theorem of its own (`foo._proof_1`), and a `match` a definition (`foo.match_1`), and
+reuses one made earlier for the same statement: `bar`'s value may refer to `foo._proof_1`. Elaborated
+again without `foo`, `bar` makes `bar._proof_1`, and its value is no longer the project's. The
+constants found are looked through, in their statements and, for those that are not theorems, their
+values. -/
+def auxiliaryOwners (env : Environment) (rootPrefix : Name) (isDecl : Name → Bool) (n : Name)
+    (info : ConstantInfo) (includeValue : Bool) : Array Name := Id.run do
+  let used (ci : ConstantInfo) (withValue : Bool) : Array Name :=
+    ci.type.getUsedConstants ++ (if withValue then
+      ((ci.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[] else #[])
+  let mut owners : Array Name := #[]
+  let mut seen : Std.HashSet Name := {}
+  let mut todo := used info includeValue
+  while !todo.isEmpty do
+    let c := todo.back!
+    todo := todo.pop
+    if seen.contains c || isDecl c || !isProjectLocalConst env rootPrefix c then continue
+    seen := seen.insert c
+    let mut owner := c.getPrefix
+    while !owner.isAnonymous && !isDecl owner do owner := owner.getPrefix
+    if !owner.isAnonymous && owner != n && !owners.contains owner then owners := owners.push owner
+    if let some ci := env.find? c then
+      todo := todo ++ used ci !(ci matches .thmInfo _)
+  return owners
+
 /-- What the emitted text of each of `names` needs, from `MeaningGraph`, in the order of `names`.
 
 A declaration whose value is replaced by `sorry` (`valueDropped`) needs what its statement mentions:
 its `statement` edges, and every constant its type mentions, proofs included, looked through the
 constants that are not declarations (`MeaningGraph.expandThrough`). The statement edges erase
 proofs, but the statement's text needs them: an instance of a `Prop`-valued class is a proof, and
-the file must declare it for instance search to find it. Any other is emitted whole and needs what its term mentions, the lemmas its
-proofs call included: its `term` edges. Proofs inside a definition are mostly replaced by `sorry`
-too, but not the tactic blocks that make up a whole value (`wholeValueTacticRanges`), and those
-run in the extracted file. Both add the `source` dependencies, what the source needs and no term
-mentions: coercion instances, and the constants a notation expands to. -/
+the file must declare it for instance search to find it. Any other is emitted whole and needs what
+its term mentions, the lemmas its proofs call included, for those proofs run in the file: its `term`
+edges. Both add the `source` dependencies, what the source needs and no term mentions: coercion
+instances, and the constants a notation expands to; and the declarations whose auxiliary constants
+they refer to (`auxiliaryOwners`). -/
 def neededDeps (ctx : MeaningGraph.Context) (cache : MeaningGraph.Cache)
     (valueDropped : Name → Bool) (names : Array Name) :
     MetaM (Array (Name × Array Name) × MeaningGraph.Context × MeaningGraph.Cache) := do
@@ -1625,6 +1426,7 @@ def neededDeps (ctx : MeaningGraph.Context) (cache : MeaningGraph.Cache)
       let (source, c) := ctx.sourceDeps cache n info
       cache := c
       let mut deps := deps ++ source
+        ++ auxiliaryOwners ctx.env ctx.rootPrefix ctx.exposed.contains n info !(valueDropped n)
       if valueDropped n then
         let (ofType, c) := MeaningGraph.expandThrough ctx.env (!ctx.isNode ·) cache
           (MeaningGraph.usedConstantsOf ctx.env n info (includeValue := false))
@@ -1650,144 +1452,62 @@ process that has imported before. Lean clears the flag allowing initializers aft
 @[implemented_by importWithExtensionsImpl]
 opaque importWithExtensions (imports : Array Import) : IO Environment
 
-/-! ## Restoring section variables
+/-! ## The theorems Comparator checks -/
 
-Lean decides which section variables a definition or an instance takes from its value. An altered
-declaration (`CommandEntry.altered`), a proof in its value replaced by `sorry`, may therefore take
-fewer than the project's: `isGaussian_map := isGaussian_map_of_measurable (by fun_prop)` takes
-`[BorelSpace E]` only because `fun_prop`'s proof uses it, and with `sorry` it states a weaker
-theorem. Which variables a replaced proof used cannot be read off the source, an instance binder
-being used by instance search: the file is elaborated, and its types compared with the project's.
--/
+/-- The theorems Comparator is to check in the file for `target`, which declares `decls`: those it
+reaches from `target`, as it walks the file (see "Comparator" above). The walk follows a statement,
+the constructors of an inductive type, and the value of a definition, which a proof inside it makes
+reach theorems Lean made of that proof (`foo._proof_1`); it stops at a theorem, whose proof
+Comparator does not compare, and at the constants of an imported library, the same on both sides.
+`target` comes first, then the others in the order the file declares them, then the theorems Lean
+made.
 
-/-- A key for each binder of the telescope of `type`, equal for equal binders in two elaborations,
-however many binders precede: a structural hash of the binder's type, where each earlier binder it
-refers to reads as a constant named after that binder's key. The keys of a declaration's type in
-the project and in an extracted file are computed in different processes and compared. -/
-partial def binderKeys (type : Expr) : Array String :=
-  go type #[]
-where
-  go (e : Expr) (acc : Array String) : Array String :=
-    match e with
-    | .forallE _ d b _ =>
-      let base := toString (hash d)
-      let key := (List.range (acc.size + 1)).map (fun k => if k == 0 then base else s!"{base}_{k}")
-        |>.find? (!acc.contains ·) |>.getD base
-      go (b.instantiate1 (mkConst (.str .anonymous s!"b{key}"))) (acc.push key)
-    | _ => acc
+Also returns the private declarations the walk reaches, where it stops: a private name holds the
+name of its module, which the file does not have, so Comparator cannot match one. -/
+def theoremsToCheck (env : Environment) (rootPrefix : Name) (decls : Array Name) (target : Name) :
+    Array Name × Array Name := Id.run do
+  let mut found : Array Name := #[]
+  let mut privates : Array Name := #[]
+  let mut seen : Std.HashSet Name := {}
+  let mut todo : Array Name := #[target]
+  while !todo.isEmpty do
+    let n := todo.back!
+    todo := todo.pop
+    if seen.contains n || !isProjectLocalConst env rootPrefix n then continue
+    seen := seen.insert n
+    if isPrivateName n then
+      privates := privates.push n
+      continue
+    let some info := env.find? n | continue
+    let mut deps := info.type.getUsedConstants
+    match info with
+    | .thmInfo _ => found := found.push n
+    | .inductInfo i => deps := deps ++ i.ctors.toArray
+    | .ctorInfo c => deps := deps.push c.induct
+    | _ => deps := deps ++ ((info.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[]
+    todo := todo ++ deps.reverse
+  let declared := decls.filter fun n => n != target && found.contains n
+  return (found.filter (· == target) ++ declared
+    ++ found.filter (fun n => n != target && !declared.contains n), privates)
 
-/-- The positions, in the binders of a declaration in the project (`project`, their keys), of those
-its extracted version (`file`) lacks, when the binders of `file` are those of `project` with some
-left out; `none` when they do not align so. -/
-def missingBinders (project file : Array String) : Option (Array Nat) := Id.run do
-  let mut j := 0
-  let mut missing := #[]
-  for i in [0:project.size] do
-    if file[j]? == some project[i]! then j := j + 1 else missing := missing.push i
-  return if j == file.size then some missing else none
-
-/-- Elaborates the text of an extracted file against an environment of its imports, and gives the
-binder keys of each of `decls` (`none` for one that did not elaborate). Run in a process of its own
-(`challenge-gen --binder-keys`): the environment cannot be freed, its extensions being loaded. -/
-def fileBinderKeys (text : String) (decls : Array Name) :
-    IO (Array (Name × Option (Array String))) := do
-  let inputCtx := Parser.mkInputContext text "<challenge>"
-  let (header, parserState, messages) ← Parser.parseHeader inputCtx
-  let imports := Elab.headerToImports header
-  let env ← importWithExtensions imports
-  let s ← IO.processCommands inputCtx parserState (Command.mkState env messages {})
-  let fileEnv := s.commandState.env
-  return decls.map fun n => (n, (fileEnv.find? n).map (binderKeys ·.type))
-
-/-- How `restoreVariables` elaborates a file: given its text and declarations, their binder keys.
-`challenge-gen` runs `fileBinderKeys` in a child process, one file at a time. -/
-abbrev CheckFile := String → Array Name → IO (Std.HashMap Name (Array String))
-
-/-- `fileBinderKeys` in this process: its environments are never freed, so only for a few files. -/
-def checkInProcess : CheckFile := fun text decls => do
-  let keys ← fileBinderKeys text decls
-  return keys.foldl (fun m (n, k?) => match k? with | some k => m.insert n k | none => m) {}
-
-/-- The name and printed type of each binder in the telescope of `type`. -/
-def binderInfos (type : Expr) : MetaM (Array (Name × String)) :=
-  Meta.forallTelescope type fun xs _ => xs.mapM fun x => do
-    let d ← x.fvarId!.getDecl
-    return (d.userName, toString (← Meta.ppExpr d.type))
-
-/-- A type as printed or written, compared up to spaces and namespaces: each dotted name is read
-as its last component, since the file's `open`s shorten what the printer writes in full. -/
-def typeKey (text : String) : String :=
-  let words := (text.split (·.isWhitespace)).toList.map fun w =>
-    let w := w.toString
-    -- `(MeasureTheory.Measure.map` reads `(map`: what precedes the name, and its last component.
-    let lead := w.takeWhile (fun c => !isIdFirst c && c != '«')
-    let rest := (w.drop lead.length).toString
-    if (rest.splitOn ".").length > 1 && rest.all (fun c => isIdRest c || c == '.' || c == ')' || c == ']') then
-      lead.toString ++ ((rest.splitOn ".").getLast!)
-    else w
-  String.join words
-
-/-- The type of an anonymous instance binder as written, `[C]` without its brackets. -/
-def instanceBinderType? (binder : String) : Option String :=
-  let b := binder.trimAscii.toString
-  if b.startsWith "[" && b.endsWith "]" && (b.splitOn ":").length == 1 then
-    some ((b.drop 1).dropEnd 1).trimAscii.toString
-  else none
-
-/-- The text of `assemble`'s file, with the section variables its altered declarations lost
-restored. A definition or an instance takes the variables its value uses (`include` forces one
-into theorems only), so each lost variable is mentioned where the declaration's first replaced
-proof was: `(have := hk; sorry)` for a named one, `(have := (inferInstance : BorelSpace E); sorry)`
-for an anonymous instance binder, instance search finding the variable. Repeated until nothing is
-missing, at most three times. A variable that cannot be restored so is reported. -/
-def restoreVariables (env : Environment) (check : CheckFile) (assemble : Fixes → Assembled) :
-    IO String := do
-  let mut fixes : Fixes := {}
-  let mut file := assemble fixes
-  for _ in [0:3] do
-    -- Only the declarations whose project type the file can be compared with.
-    let altered := file.altered.filter (env.contains ·)
-    if altered.isEmpty then break
-    let fileKeys ← check file.text altered
-    let mut changed := false
-    for n in altered do
-      let some p := env.find? n | continue
-      let some f := fileKeys.get? n | continue
-      let some missing := missingBinders (binderKeys p.type) f | continue
-      if missing.isEmpty then continue
-      let binders ← runMetaIO env (binderInfos p.type)
-      for i in missing do
-        let some (userName, typeText) := binders[i]? | continue
-        let mention? : Option String :=
-          if !userName.hasMacroScopes then
-            -- A named variable, bound by a binder the file kept.
-            if file.variableBinders.any (fun b => (binderBoundNames b).contains userName.toString)
-            then some userName.toString else none
-          else
-            -- An anonymous instance binder, by its type as written in the file's `variable`.
-            (file.variableBinders.findSome? fun b => (instanceBinderType? b).filter
-              (typeKey · == typeKey typeText)).map (s!"(inferInstance : {·})")
-        match mention? with
-        | some m =>
-          let current := fixes.mentions.getD n #[]
-          unless current.contains m do
-            fixes := { fixes with mentions := fixes.mentions.insert n (current.push m) }
-            changed := true
-        | none =>
-          IO.eprintln s!"challenge-gen: {n} takes the variable `{typeText}` in the project, which \
-            its file does not restore"
-    if !changed then break
-    file := assemble fixes
-  return file.text
+/-- Comparator's configuration for a file whose theorems to check are `theorems`, under Palomar's
+conventions: the file as the module `Challenge`, the solution as `Solution`, and only the axioms
+of Lean's foundations permitted. Written by hand, for its keys to come in the order of Palomar's
+example. -/
+def comparatorConfig (theorems : Array Name) : String :=
+  let str (s : String) : String := (toJson s).compress
+  let names := theorems.map fun n => s!"\n    {str (n.toString (escape := false))}"
+  "{\n" ++
+  s!"  \"challenge_module\": {str "Challenge"},\n" ++
+  s!"  \"solution_module\": {str "Solution"},\n" ++
+  s!"  \"theorem_names\": [{",".intercalate names.toList}{if names.isEmpty then "" else "\n  "}],\n" ++
+  "  \"permitted_axioms\": [\"propext\", \"Quot.sound\", \"Classical.choice\"]\n}\n"
 
 /-- Writes a standalone `<anchorIdOf target>.lean` file into `dir` for each of `targets`, the
 declarations of the project `ctx` was made for (`MeaningGraph.Context.of env rootPrefix`), whose
-source files are under `projectDir`. Targets that are not declarations of the project are skipped.
-Returns the number of files written.
-
-`check` elaborates a file to restore the section variables its declarations lost
-(`restoreVariables`); the default does it in this process, whose memory then grows with each file
-checked, and `challenge-gen` does it in a child process instead.
+source files are under `projectDir`, and beside it `<anchorIdOf target>.json`, Comparator's
+configuration for it (`comparatorConfig`). Targets that are not declarations of the project are
+skipped. Returns the number of files written.
 
 `builtinOptions` are Lean's own options, those registered before any module was imported
 (`getOptionDecls` at the start of the process): the options the project is built with are set
@@ -1797,8 +1517,7 @@ Each project source file is parsed once. A file then holds its target and, trans
 declaration in it needs: what `neededDeps` says, the notations its source uses, and the other
 declarations its source command defines. -/
 def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePath)
-    (targets : Array Name) (builtinOptions : Std.HashSet Name := {})
-    (check : CheckFile := checkInProcess) : IO Nat := do
+    (targets : Array Name) (builtinOptions : Std.HashSet Name := {}) : IO Nat := do
   let env := ctx.env
   let rootPrefix := ctx.rootPrefix
   let exposedNames := ctx.exposed
@@ -1924,10 +1643,17 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
         unless keep.contains m do
           keep := keep.insert m
           todo := todo.push m
-    let assemble := fun fixes => assembleTarget env rootPrefix cache moduleOrder exposedNames keep
-      projectNamespaces moduleOptions projectShortNames target fixes
-    let content ← restoreVariables env check assemble
-    IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") content
+    let file := assembleTarget env rootPrefix cache moduleOrder exposedNames keep projectNamespaces
+      moduleOptions projectShortNames target
+    IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") file.text
+    let (theorems, privates) := theoremsToCheck env rootPrefix file.decls target
+    if privates.contains target then
+      IO.eprintln s!"challenge-gen: Comparator cannot check {privateToUserName target}, which is private"
+    else if let some p := privates[0]? then
+      IO.eprintln s!"challenge-gen: Comparator cannot check the file of {target}: it reaches \
+        {privateToUserName p}, which is private{if privates.size > 1 then
+          s!" (and {privates.size - 1} more)" else ""}"
+    IO.FS.writeFile (dir / s!"{anchorIdOf target}.json") (comparatorConfig theorems)
   return targets.size
 
 end ChallengeGen

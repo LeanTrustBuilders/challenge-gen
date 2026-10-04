@@ -3,7 +3,8 @@
 #
 # Builds the fixture, writes the file of every one of its declarations, compiles each file with
 # `lake env lean` (every one must compile), checks what a few of them hold, and that each target
-# states what the fixture states (test/fidelity.py). Then writes the file of one declaration only.
+# states what the fixture states and each file lists the theorems Comparator must check
+# (test/fidelity.py). Then writes the file of one declaration only.
 #
 # Usage: test/run.sh [KEEP_DIR]   (after `lake build`)
 #   With KEEP_DIR, the generated files are copied to KEEP_DIR.
@@ -24,8 +25,12 @@ toolchain=$(sed 's/.*:v//' "$root/lean-toolchain" | tr -d '[:space:]')
 sed -i "s/^rev = .*/rev = \"v$toolchain\"/" "$work/fixture/lakefile.toml"
 (cd "$work/fixture" && lake build -q >/dev/null)
 
-(cd "$work/fixture" && lake env "$bin" --root Fixture --out "$work/out")
+(cd "$work/fixture" && lake env "$bin" --root Fixture --out "$work/out") 2> "$work/gen.log"
+grep -q "file of Fixture.revealed: it reaches Fixture.secret, which is private" "$work/gen.log" ||
+  { echo "FAIL: a file Comparator cannot check, reaching a private declaration, is not reported" >&2
+    cat "$work/gen.log" >&2; exit 1; }
 count=$(find "$work/out" -name '*.lean' | wc -l)
+[ "$(find "$work/out" -name '*.json' | wc -l)" -eq "$count" ] || { echo "FAIL: a file has no configuration" >&2; exit 1; }
 [ "$count" -gt 0 ] || { echo "FAIL: no file written" >&2; exit 1; }
 
 failed=0
@@ -40,10 +45,12 @@ done
 echo "ok: the $count files compile"
 
 python3 - "$work/out" <<'EOF'
-import pathlib, sys
+import json, pathlib, sys
 out = pathlib.Path(sys.argv[1])
 def read(name):
     return (out / (name.replace(".", "___") + ".lean")).read_text()
+def config(name):
+    return json.loads((out / (name.replace(".", "___") + ".json")).read_text())
 def check(cond, msg):
     if not cond:
         sys.exit(f"FAIL: {msg}")
@@ -56,25 +63,42 @@ for f in out.glob("*.lean"):
     check("pp.unicode.fun" not in text and "linter.unusedVariables" not in text,
           f"{f.name}: an option that changes only what Lean reports is set")
     check("@[claim" not in text and "@[domain" not in text, f"{f.name} keeps an annotation")
+    check(text.startswith("module\n"), f"{f.name} is not a module")
+    cfg = json.loads(f.with_suffix(".json").read_text())
+    check(sorted(cfg) == ["challenge_module", "permitted_axioms", "solution_module", "theorem_names"]
+          and cfg["permitted_axioms"] == ["propext", "Quot.sound", "Classical.choice"],
+          f"{f.name}: its configuration is not Comparator's, with Lean's axioms only")
 
 claim = read("Fixture.pred'_lt")
 check("theorem pred'_lt (n : Nat) (h : 0 < n) : pred' n < n := sorry" in claim,
       "pred'_lt: the proof is replaced by sorry")
 check("def pred' (n : Nat) : Nat := n - 1" in claim, "pred'_lt: pred' is inlined")
 check("helper" not in claim, "pred'_lt: a lemma its proof calls is inlined")
-check(not claim.lstrip().startswith("import"), "pred'_lt: imports, with nothing outside Lean core")
+check("import" not in claim.split("/-!")[0], "pred'_lt: imports, with nothing outside Lean core")
+check("\n@[expose] public section\n" in claim,
+      "pred'_lt: the declarations of a file that is not a module are not public and exposed")
+check(config("Fixture.pred'_lt")["theorem_names"] == ["Fixture.pred'_lt"],
+      "pred'_lt: the theorems to check are not it alone")
 
 check("instance instIsSmallOfNatNat : IsSmall 3" in read("Fixture.smallVal_three"),
       "smallVal_three: the instance its statement needs, a proof, is missing")
 
-check("⟨1, sorry⟩" in read("Fixture.one"), "one: an embedded proof is kept")
+check("⟨1, by decide⟩" in read("Fixture.one"), "one: a proof inside a definition is replaced")
+check(config("Fixture.one")["theorem_names"] == ["Fixture.one._proof_1"],
+      "one: the theorem Lean makes of the proof inside it is not to be checked")
+also_one = read("Fixture.alsoOne")
+check("def one : Positive" in also_one
+      and config("Fixture.alsoOne")["theorem_names"] == ["Fixture.one._proof_1"],
+      "alsoOne: the declaration whose proof Lean reuses in it is missing")
+check("public section" in read("Fixture.revealed") and "@[expose]" not in read("Fixture.revealed"),
+      "revealed: a module's definition gets an exposed value, which cannot use a private one")
+check(config("Fixture.smallVal_three")["theorem_names"]
+      == ["Fixture.smallVal_three", "Fixture.instIsSmallOfNatNat"],
+      "smallVal_three: the instance its statement needs, a theorem, is not to be checked")
 check("def two : Nat := by exact 2" in read("Fixture.two"), "two: a tactic value is replaced")
 box = read("Fixture.Box")
-check("by exact 0" not in box and "size : Nat := sorry" in box,
-      "Box: a field's tactic default is kept")
-code = read("Fixture.Uses.Code")
-check("deriving" not in code and "instance instBEqCode : BEq (Code) := sorry" in code,
-      "Code: the deriving clause is not replaced by an instance")
+check("size : Nat := by exact 0" in box, "Box: a field's tactic default, part of its type, is replaced")
+check("deriving BEq" in read("Fixture.Uses.Code"), "Code: its deriving clause is replaced")
 
 quad = read("Fixture.Uses.quad")
 check('notation:max "⟪" n "⟫" => double n' in quad, "quad: the notation it uses is not replayed")
@@ -85,7 +109,9 @@ check("box_val" not in quad, "quad: a declaration after it is inlined")
 for name in ["Fixture.pick", "Fixture.pick'"]:
     text = read(name)
     check("noncomputable section" in text, f"{name}: its noncomputable section is lost")
-    check("@[expose]" not in text and "public" not in text, f"{name}: the module system is kept")
+check("@[expose] public noncomputable section" in read("Fixture.pick'")
+      and "@[expose] public section" not in read("Fixture.pick'"),
+      "pick': a module's section is not replayed as written, alone")
 
 local = read("Fixture.quad'")
 check('local notation "⦃" n "⦄" => double (double n)' in local,
@@ -113,27 +139,23 @@ check("def earlyId (ℵ : Nat) : Nat := ⟪ℵ⟫" in (out / "earlyId.lean").rea
 check("instance instIsPositiveOfNat : Fixture.IsPositive 1" in read("Nat.instIsPositiveOfNat"),
       "Nat.instIsPositiveOfNat: an unnamed instance is not written with the project's name")
 
-check("instance Wrap.instBEqNum : BEq (Wrap.Num) := sorry" in read("Fixture.Wrap.instBEqNum"),
-      "Wrap.instBEqNum: a derived instance is not written with the project's name")
+check("def Wrap.Num := Nat\nderiving BEq" in read("Fixture.Wrap.instBEqNum"),
+      "Wrap.instBEqNum: a derived instance is not derived")
 check("structure Sized (n : Nat := by exact 3)" in read("Fixture.Sized"),
       "Sized: a parameter's tactic default, part of the structure's type, is replaced")
 
-check("⟨k - 1, (have := hk; sorry)⟩" in read("Fixture.predBelow"),
-      "predBelow: a named variable only its replaced proof used is not mentioned")
-check("⟨(have := (inferInstance : IsPositive m); sorry)⟩" in read("Fixture.instIsPositiveHAddNatOfNat"),
-      "instIsPositiveHAddNatOfNat: an instance binder only its replaced proof used is not mentioned")
-for f in out.glob("*.lean"):
-    check("\ue000" not in f.read_text(), f"{f.name}: the mark of a replaced proof is left")
+check("⟨k - 1, by omega⟩" in read("Fixture.predBelow"),
+      "predBelow: the proof inside it, the only use of a variable, is replaced")
 
 box_val = read("Fixture.Uses.box_val")
 check("HasZero'" not in box_val, "box_val: a binder outside its closure is kept")
-print("ok: proofs, values, annotations, notation, sections, binders, options and closures")
+print("ok: proofs, values, annotations, notation, sections, binders, options, closures, configurations")
 EOF
 
 # Compiling is not enough: a file can compile and state another theorem than the project's.
 if ! python3 "$here/fidelity.py" "$work/fixture" "$work/out" Fixture "$work/fidelity" 4 > "$work/fidelity.log"; then
   echo "FAIL: statements differ from the project's:" >&2
-  grep -A2 '^DIFFERS\|^fail' "$work/fidelity/fidelity.txt" | head -40 >&2
+  grep -A2 '^DIFFERS\|^UNLISTED\|^fail' "$work/fidelity/fidelity.txt" | head -40 >&2
   exit 1
 fi
 echo "ok: every target states what the project states ($(cat "$work/fidelity.log"))"
@@ -143,15 +165,17 @@ echo "ok: every target states what the project states ($(cat "$work/fidelity.log
 (cd "$work/fixture" && lake env "$bin" --root Fixture.Slice --out "$work/slice" >/dev/null)
 if ! python3 "$here/fidelity.py" "$work/fixture" "$work/slice" Fixture "$work/fidelity-slice" 4 > "$work/fidelity-slice.log"; then
   echo "FAIL: the files of a slice:" >&2
-  grep -A3 '^DIFFERS\|^fail' "$work/fidelity-slice/fidelity.txt" | head -20 >&2
+  grep -A3 '^DIFFERS\|^UNLISTED\|^fail' "$work/fidelity-slice/fidelity.txt" | head -20 >&2
   exit 1
 fi
 echo "ok: a slice's files compile and state what the fixture states ($(cat "$work/fidelity-slice.log"))"
 
 (cd "$work/fixture" && lake env "$bin" --root Fixture --decl Fixture.Uses.quad --out "$work/one" >/dev/null)
-[ "$(ls "$work/one")" = "Fixture___Uses___quad.lean" ] || { echo "FAIL: --decl" >&2; ls "$work/one" >&2; exit 1; }
-cmp -s "$work/one/Fixture___Uses___quad.lean" "$work/out/Fixture___Uses___quad.lean" ||
-  { echo "FAIL: one declaration's file differs from the same file written with all" >&2; exit 1; }
+[ "$(ls "$work/one" | tr '\n' ' ')" = "Fixture___Uses___quad.json Fixture___Uses___quad.lean " ] || { echo "FAIL: --decl" >&2; ls "$work/one" >&2; exit 1; }
+for ext in lean json; do
+  cmp -s "$work/one/Fixture___Uses___quad.$ext" "$work/out/Fixture___Uses___quad.$ext" ||
+    { echo "FAIL: one declaration's .$ext differs from the same file written with all" >&2; exit 1; }
+done
 echo "ok: --decl writes that declaration's file only, the same"
 
-if [ $# -ge 1 ]; then mkdir -p "$1" && cp "$work/out"/*.lean "$1"/; fi
+if [ $# -ge 1 ]; then mkdir -p "$1" && cp "$work/out"/*.lean "$work/out"/*.json "$1"/; fi

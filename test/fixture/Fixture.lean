@@ -4,6 +4,7 @@ import Fixture.Notation
 import Fixture.Uses
 import Fixture.Choice
 import Fixture.ChoiceModule
+import Fixture.Private
 import Fixture.Scoped
 import Fixture.Twin
 import Fixture.Include

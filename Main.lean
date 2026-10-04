@@ -4,7 +4,8 @@ open Lean ChallengeGen
 
 def usage : String := "\
 challenge-gen: one standalone Lean file per declaration of a compiled project, made of the
-project's own source text, with its dependencies inlined and its proofs replaced by `sorry`.
+project's own source text, with its dependencies inlined and its theorems' proofs replaced by
+`sorry`: a challenge for Comparator, with the project as the solution.
 
 Run inside the project, under `lake env`:
 
@@ -19,7 +20,8 @@ Options:
   --src-dir <dir>      where the project's sources are (default: .)
   --module <Module>    import this module instead of every module under the root (repeatable)
 
-Each file is named after its declaration: `Foo.bar` is written to `Foo___bar.lean`.
+Each file is named after its declaration: `Foo.bar` is written to `Foo___bar.lean`, and beside it
+`Foo___bar.json`, Comparator's configuration, which lists the theorems to check.
 "
 
 structure Config where
@@ -57,35 +59,6 @@ def discoverModules (srcDir : System.FilePath) (root : Name) : IO (Array Name) :
         mods := mods.push (parts.foldl Name.str root)
   return mods.qsort (·.toString < ·.toString)
 
-/-- The binder keys of `decls` in the extracted file at `path`, as JSON: what a child process run
-with `--binder-keys` prints for `checkInChild`. -/
-def printBinderKeys (path : String) (decls : List String) : IO UInt32 := do
-  initSearchPath (← findSysroot)
-  let names := decls.toArray.map fun d => (Syntax.decodeNameLit ("`" ++ d)).getD d.toName
-  let keys ← fileBinderKeys (← IO.FS.readFile path) names
-  IO.println <| Json.compress <| Json.mkObj <| keys.toList.filterMap fun (n, k?) =>
-    k?.map fun k => (n.toString, toJson k)
-  return 0
-
-/-- `restoreVariables`'s elaboration of a file, in a child process (this executable, with
-`--binder-keys`): an environment with its extensions loaded cannot be freed, so each file is
-elaborated in a process that ends with it. -/
-def checkInChild (dir : System.FilePath) : CheckFile := fun text decls => do
-  let path := dir / ".challenge-gen-check.lean"
-  IO.FS.writeFile path text
-  let out ← IO.Process.output
-    { cmd := (← IO.appPath).toString
-      args := #["--binder-keys", path.toString] ++ decls.map (·.toString) }
-  IO.FS.removeFile path
-  if out.exitCode != 0 then
-    throw <| IO.userError s!"checking a file failed:\n{out.stderr}"
-  let json ← IO.ofExcept (Json.parse out.stdout)
-  let some fields := (json.getObj?).toOption | return {}
-  return fields.toArray.foldl (init := {}) fun m (k, v) =>
-    match (fromJson? v : Except String (Array String)) with
-    | .ok keys => m.insert ((Syntax.decodeNameLit ("`" ++ k)).getD k.toName) keys
-    | .error _ => m
-
 unsafe def main (args : List String) : IO UInt32 := do
   -- Lean's own options, registered before any module is imported: the only ones every file knows.
   let builtinOptions : Std.HashSet Name :=
@@ -95,8 +68,6 @@ unsafe def main (args : List String) : IO UInt32 := do
   enableInitializersExecution
   if args.any (· ∈ ["--help", "-h"]) then
     IO.println usage; return 0
-  if let "--binder-keys" :: path :: decls := args then
-    return ← printBinderKeys path decls
   match ← parseArgs args {} with
   | .error e => IO.eprintln s!"{e}\n\n{usage}"; return 2
   | .ok cfg =>
@@ -116,7 +87,7 @@ unsafe def main (args : List String) : IO UInt32 := do
         throw <| IO.userError
           s!"not declarations of {cfg.root}: {", ".intercalate (unknown.toList.map toString)}"
       IO.FS.createDirAll cfg.out
-      let n ← writeChallenges ctx cfg.srcDir cfg.out targets builtinOptions (checkInChild cfg.out)
+      let n ← writeChallenges ctx cfg.srcDir cfg.out targets builtinOptions
       IO.println s!"wrote {n} files to {cfg.out}"
       return 0
     catch e =>

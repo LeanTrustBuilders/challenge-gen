@@ -22,8 +22,8 @@ variable {m : Nat} [IsPositive m]
 variables its value uses, so its value cannot become `sorry` without changing its signature. -/
 instance : IsPositive (m * 1) := by simpa using (inferInstance : IsPositive m)
 
-/-- Only its embedded proof uses `[IsPositive m]`: with that proof replaced by `sorry`, the instance
-would not take it, unless the `sorry` mentions it. -/
+/-- Only the proof inside its value uses `[IsPositive m]`, which it takes only if that proof is
+kept. -/
 instance : IsPositive (m + 0) := ⟨by have := (inferInstance : IsPositive m).pos; omega⟩
 
 end

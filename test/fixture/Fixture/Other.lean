@@ -1,6 +1,10 @@
-import Fixture.Slice.A
+module
+
+public import Fixture.Slice.A
 
 /-! Outside the slice `Fixture.Slice`, importing a module of it. -/
+
+@[expose] public section
 
 namespace Fixture
 

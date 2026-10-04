@@ -10,8 +10,16 @@ printed with `pp.all`, every argument and universe explicit and no notation, and
 renamed, so neither notation, `open`s nor binder names play a part. Proofs inside a
 type are erased first: one statement may elaborate a proof in place where the other abstracted it
 into an auxiliary lemma, and by proof irrelevance they state the same. Private targets are
-skipped. Writes WORK_DIR/fidelity.txt and prints a count of `same`, `DIFFERS`, `fail` (does not
-compile) and `no-project` (not found in the project); exits with 1 if any file differs or fails.
+skipped.
+
+Each file is also checked against its `<target>.json`, Comparator's configuration: walking the file
+as Comparator does from the theorems to check, no constant reached may use `sorry` but in the proof
+of one of them, and each of these must be a theorem of the file, its name read as Comparator reads
+it (`String.toName`). A file that fails this is `UNLISTED`.
+
+Writes WORK_DIR/fidelity.txt and prints a count of `same`, `DIFFERS`, `UNLISTED`, `fail` (does not
+compile) and `no-project` (not found in the project); exits with 1 if any file differs, is
+unlisted or fails.
 """
 import collections
 import concurrent.futures as cf
@@ -62,6 +70,41 @@ def probe(key, name):
             f"  IO.println s!\"@@@{key}@@@{{t.getD \"MISSING\"}}@@@END\"\n")
 
 
+def listing(names):
+    """Walks the file as Comparator does from `names`, the theorems to check: through the
+    statements, the constructors of inductive types and the values of definitions, stopping at
+    theorems to check and at imported constants. Prints each constant reached whose statement or
+    value uses `sorry`, and each of `names` that is not a theorem of the file."""
+    literals = ", ".join(json.dumps(n, ensure_ascii=False) for n in names)
+    return f"""
+open Lean in
+#eval show CoreM Unit from do
+  let env ← getEnv
+  let listed : Array Name := #[{literals}].map String.toName
+  for n in listed do
+    unless (env.find? n).any (· matches .thmInfo _) do
+      IO.println s!"@@@NOTTHM@@@{{n.toString (escape := false)}}@@@END"
+  let mut seen : Std.HashSet Name := {{}}
+  let mut todo := listed
+  while !todo.isEmpty do
+    let n := todo.back!
+    todo := todo.pop
+    if seen.contains n || !env.constants.map₂.contains n then continue
+    seen := seen.insert n
+    let some ci := env.find? n | continue
+    let value := if listed.contains n then #[] else
+      ((ci.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[]
+    let used := ci.type.getUsedConstants ++ value
+    if used.contains ``sorryAx then
+      IO.println s!"@@@SORRY@@@{{n.toString (escape := false)}}@@@END"
+    todo := todo ++ used
+    match ci with
+    | .inductInfo i => todo := todo ++ i.ctors.toArray
+    | .ctorInfo c => todo := todo.push c.induct
+    | _ => pure ()
+"""
+
+
 def types(output):
     return {m.group(1): m.group(2) for m in re.finditer(r"@@@(\d+)@@@(.*?)@@@END", output, re.S)
             if m.group(2) != "MISSING"}
@@ -81,11 +124,20 @@ expected = types(lean(reference).stdout)
 def check(indexed):
     key, path = indexed
     copy = work / path.name
-    # The probe runs in `MetaM`: `import Lean` goes first, beside the file's own imports.
-    copy.write_text("import Lean\n" + path.read_text() + PRELUDE + probe(key, name_of(path)))
+    # The probe runs in `MetaM`: `Lean` is imported first, beside the file's own imports.
+    text = path.read_text()
+    assert text.startswith("module\n"), path
+    listed = json.loads(path.with_suffix(".json").read_text())["theorem_names"]
+    copy.write_text("module\n\npublic import Lean\n" + text[len("module\n"):] + PRELUDE
+                    + probe(key, name_of(path)) + listing(listed))
     result = lean(copy)
     if result.returncode != 0:
         return path.name, "fail", result.stdout + result.stderr
+    unlisted = re.findall(r"@@@SORRY@@@(.*?)@@@END", result.stdout)
+    not_theorems = re.findall(r"@@@NOTTHM@@@(.*?)@@@END", result.stdout)
+    if unlisted or not_theorems:
+        return path.name, "UNLISTED", (f"  reached, uses sorry, not to be checked: {unlisted}\n"
+                                       f"  to be checked, not a theorem: {not_theorems}\n")
     want = expected.get(str(key))
     if want is None:
         return path.name, "no-project", ""
@@ -101,4 +153,4 @@ with open(work / "fidelity.txt", "w") as report:
         report.write(f"{status} {name}\n{detail}")
 counts = collections.Counter(status for _, status, _ in results)
 print(dict(counts))
-sys.exit(1 if counts["DIFFERS"] or counts["fail"] else 0)
+sys.exit(1 if counts["DIFFERS"] or counts["UNLISTED"] or counts["fail"] else 0)

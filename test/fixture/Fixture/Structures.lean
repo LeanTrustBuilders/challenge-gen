@@ -18,6 +18,10 @@ def Positive : Type := { n : Nat // 0 < n }
 
 def one : Positive := ⟨1, by decide⟩
 
+/-- Its proof states what `one`'s does: Lean takes the theorem it made of that one,
+`one._proof_1`. -/
+def alsoOne : Positive := ⟨1, by decide⟩
+
 def two : Nat := by exact 2
 
 class HasZero' (α : Type u) where
