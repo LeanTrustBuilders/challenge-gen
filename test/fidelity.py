@@ -12,7 +12,7 @@ type are erased first: one statement may elaborate a proof in place where the ot
 into an auxiliary lemma, and by proof irrelevance they state the same. Private targets are
 skipped.
 
-Each file is also checked against its `<target>.json`, Comparator's configuration: walking the file
+Each file with a `<target>.json`, Comparator's configuration, is also checked against it: walking the file
 as Comparator does from the theorems to check, no constant reached may use `sorry` but in the proof
 of one of them, and each of these must be a theorem of the file, its name read as Comparator reads
 it (`String.toName`). A file that fails this is `UNLISTED`.
@@ -73,25 +73,31 @@ def probe(key, name):
 def listing(names):
     """Walks the file as Comparator does from `names`, the theorems to check: through the
     statements, the constructors of inductive types and the values of definitions, stopping at
-    theorems to check and at imported constants. Prints each constant reached whose statement or
-    value uses `sorry`, and each of `names` that is not a theorem of the file."""
+    theorems to check, at imported constants, and at private and hygienic names, which Comparator
+    cannot match and challenge-gen reports. Prints each constant reached whose statement or value
+    uses `sorry`, and each of `names` that is not a theorem of the file."""
     literals = ", ".join(json.dumps(n, ensure_ascii=False) for n in names)
     return f"""
 open Lean in
 #eval show CoreM Unit from do
+  -- Constants are looked up as `findAsync?` has them, completed: one elaborated in parallel, as a
+  -- theorem may be, is not in the module's own map, and `find?` shows it as an axiom.
   let env ← getEnv
+  let info? (n : Name) : Option ConstantInfo := (env.findAsync? n).map (·.toConstantInfo)
   let listed : Array Name := #[{literals}].map String.toName
   for n in listed do
-    unless (env.find? n).any (· matches .thmInfo _) do
+    unless (env.findAsync? n).any (·.kind == .thm) do
       IO.println s!"@@@NOTTHM@@@{{n.toString (escape := false)}}@@@END"
   let mut seen : Std.HashSet Name := {{}}
   let mut todo := listed
   while !todo.isEmpty do
     let n := todo.back!
     todo := todo.pop
-    if seen.contains n || !env.constants.map₂.contains n then continue
+    -- Declared in the file: a constant of the current module has no module index.
+    if seen.contains n || (env.getModuleIdxFor? n).isSome || isPrivateName n || n.hasMacroScopes then
+      continue
     seen := seen.insert n
-    let some ci := env.find? n | continue
+    let some ci := info? n | continue
     let value := if listed.contains n then #[] else
       ((ci.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[]
     let used := ci.type.getUsedConstants ++ value
@@ -127,9 +133,10 @@ def check(indexed):
     # The probe runs in `MetaM`: `Lean` is imported first, beside the file's own imports.
     text = path.read_text()
     assert text.startswith("module\n"), path
-    listed = json.loads(path.with_suffix(".json").read_text())["theorem_names"]
+    config = path.with_suffix(".json")
+    listed = json.loads(config.read_text())["theorem_names"] if config.exists() else None
     copy.write_text("module\n\npublic import Lean\n" + text[len("module\n"):] + PRELUDE
-                    + probe(key, name_of(path)) + listing(listed))
+                    + probe(key, name_of(path)) + ("" if listed is None else listing(listed)))
     result = lean(copy)
     if result.returncode != 0:
         return path.name, "fail", result.stdout + result.stderr

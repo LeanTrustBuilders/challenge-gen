@@ -29,4 +29,15 @@ class HasZero' (α : Type u) where
 
 instance : HasZero' Nat := ⟨0⟩
 
+/-- A pair, its extensionality lemma declared apart from it. -/
+structure Duo where
+  fst : Nat
+  snd : Nat
+
+@[ext] theorem Duo.ext' {p q : Duo} (h₁ : p.fst = q.fst) (h₂ : p.snd = q.snd) : p = q := by
+  cases p; cases q; simp_all
+
+/-- Its proof calls `ext`, which finds `Duo.ext'` only if it is registered. -/
+def duoSelf (p : Duo) : { q : Duo // q = p } := ⟨⟨p.fst, p.snd⟩, by ext <;> rfl⟩
+
 end Fixture

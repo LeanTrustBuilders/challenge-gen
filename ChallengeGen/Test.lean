@@ -60,60 +60,63 @@ notation (`𝓕.IsComplete` ⇒ `Filtration.IsComplete`) back to the declaration
 -- look up an exact excluded name, so an imprecise head simply fails to match and drops nothing.
 #guard binderTypeHead? "{X : ι → Ω → E}" == some `ι
 
-/-! ## `isDroppedAttribute`
+/-! ## `attributeInFile?`
 
-Attributes whose elaboration-time side effect cannot work in a standalone extraction are removed;
-the ones that *generate* declarations the closure may depend on must survive. -/
+Attributes whose elaboration-time side effect cannot work in a standalone extraction are removed or
+changed; the ones that *generate* declarations the closure may depend on must survive. -/
 
--- `@[ext]` on a theorem only registers it and proves an `_iff` converse: inert here, and the proof
--- needs a `@[refl]` lemma that is not in the closure.
-#guard isDroppedAttribute false "ext"
-#guard isDroppedAttribute false "ext (iff := false)"
--- ...but on a structure it is what *defines* `Foo.ext`/`Foo.ext_iff`, so it must stay.
-#guard !isDroppedAttribute true "ext"
+-- `@[ext]` on a theorem registers it and proves an `_iff` converse. The registration serves the
+-- proofs inside definitions; the converse's proof needs a `@[refl]` lemma that is not in the
+-- closure, unless the relation is an equality.
+#guard attributeInFile? false false "ext" == some "ext (iff := false)"
+#guard attributeInFile? false false "ext 1100" == some "ext (iff := false) 1100"
+#guard attributeInFile? false false "ext (iff := false)" == some "ext (iff := false)"
+#guard attributeInFile? false true "ext" == some "ext"
+-- ...and on a structure it is what *defines* `Foo.ext`/`Foo.ext_iff`, so it stays as written.
+#guard attributeInFile? true false "ext" == some "ext"
 -- Matching is on whole tokens, so a different attribute that merely starts with "ext" is untouched.
-#guard !isDroppedAttribute false "extern \"lean_foo\""
+#guard attributeInFile? false false "extern \"lean_foo\"" == some "extern \"lean_foo\""
 
 -- Every `to_additive` form is kept. Plain `to_additive` generates the additive sibling; the
 -- `existing` form looks inert but registers the translation that *later* `to_additive` commands
--- need, so dropping it breaks them (see `isDroppedAttribute`).
-#guard !isDroppedAttribute false "to_additive existing"
-#guard !isDroppedAttribute false "to_additive"
-#guard !isDroppedAttribute false "to_additive (attr := simps)"
+-- need, so dropping it breaks them (see `attributeInFile?`).
+#guard attributeInFile? false false "to_additive existing" == some "to_additive existing"
+#guard attributeInFile? false false "to_additive" == some "to_additive"
+#guard attributeInFile? false false "to_additive (attr := simps)" == some "to_additive (attr := simps)"
 
-#guard !isDroppedAttribute false "simp"
-#guard !isDroppedAttribute false "refl"
+#guard attributeInFile? false false "simp" == some "simp"
+#guard attributeInFile? false false "refl" == some "refl"
 
 -- The annotations of `TrustAnnotations` record something for a reading tool and do nothing in a
 -- standalone file. They are dropped in every form, which is what lets `isExcludedImport` withhold
 -- the `TrustAnnotations` import.
-#guard isDroppedAttribute false "specifies"
-#guard isDroppedAttribute false "specifies entropy"
-#guard isDroppedAttribute false "specifies entropy \"agrees with the textbook formula\""
-#guard isDroppedAttribute true "specifies"
-#guard !isDroppedAttribute false "specifies_foo"
-#guard isDroppedAttribute false "claim"
-#guard isDroppedAttribute false "claim \"the main theorem\""
-#guard isDroppedAttribute false "example_of IsPrime"
-#guard isDroppedAttribute false "nonexample_of IsPrime"
-#guard isDroppedAttribute false "domain (0 < n) \"the predecessor of 0 is 0\""
-#guard isDroppedAttribute false "up_to (fun f g => f =ᵐ[μ] g)"
+#guard (attributeInFile? false false "specifies").isNone
+#guard (attributeInFile? false false "specifies entropy").isNone
+#guard (attributeInFile? false false "specifies entropy \"agrees with the textbook formula\"").isNone
+#guard (attributeInFile? true false "specifies").isNone
+#guard (attributeInFile? false false "specifies_foo").isSome
+#guard (attributeInFile? false false "claim").isNone
+#guard (attributeInFile? false false "claim \"the main theorem\"").isNone
+#guard (attributeInFile? false false "example_of IsPrime").isNone
+#guard (attributeInFile? false false "nonexample_of IsPrime").isNone
+#guard (attributeInFile? false false "domain (0 < n) \"the predecessor of 0 is 0\"").isNone
+#guard (attributeInFile? false false "up_to (fun f g => f =ᵐ[μ] g)").isNone
 
 -- `@[characterization]` is the same story, and the `true` case matters more here: the property of a
 -- characterization is often a `structure` or a `class`.
-#guard isDroppedAttribute false "characterization existence"
-#guard isDroppedAttribute false "characterization uniqueness IsEntropy"
-#guard isDroppedAttribute false "characterization property entropy \"the Shannon axioms\""
-#guard isDroppedAttribute true "characterization property entropy"
-#guard !isDroppedAttribute false "characterizations"
+#guard (attributeInFile? false false "characterization existence").isNone
+#guard (attributeInFile? false false "characterization uniqueness IsEntropy").isNone
+#guard (attributeInFile? false false "characterization property entropy \"the Shannon axioms\"").isNone
+#guard (attributeInFile? true false "characterization property entropy").isNone
+#guard (attributeInFile? false false "characterizations").isSome
 
 -- The `local`/`scoped` attribute kind is part of the attribute's source text; matching skips it, so
--- a dropped attribute is dropped in every kind.
-#guard isDroppedAttribute false "local specifies double"
-#guard isDroppedAttribute false "scoped specifies"
-#guard isDroppedAttribute false "local ext"
-#guard !isDroppedAttribute true "local ext"
-#guard !isDroppedAttribute false "local simp"
+-- an attribute is dropped or changed in every kind.
+#guard (attributeInFile? false false "local specifies double").isNone
+#guard (attributeInFile? false false "scoped specifies").isNone
+#guard attributeInFile? false false "local ext" == some "local ext (iff := false)"
+#guard attributeInFile? true false "local ext" == some "local ext"
+#guard attributeInFile? false false "local simp" == some "local simp"
 
 /-! ## `isExcludedImport` / `isExcludedOption`
 

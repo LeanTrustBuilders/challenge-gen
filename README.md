@@ -20,8 +20,9 @@ has in the project: the text of a module of the project keeps its own `public se
   an instance with the proofs inside its value, a structure with its fields' tactic defaults, a
   definition with its `deriving` clause;
 - the annotations of [TrustAnnotations](https://github.com/LeanTrustBuilders/annotations)
-  (`@[claim]`, `@[specifies]`, `@[domain]`, …) are removed, with their import and their options,
-  and so is `@[ext]` on a theorem;
+  (`@[claim]`, `@[specifies]`, `@[domain]`, …) are removed, with their import and their options;
+- `@[ext]` on a theorem whose conclusion is not an equality becomes `@[ext (iff := false)]`: the
+  `_iff` lemma it would prove needs the relation's `@[refl]` lemma, which no dependency records;
 - `variable` binders that mention a declaration left out are dropped, and so are the `include` and
   `omit` entries naming them; sections and namespaces left empty, and `set_option` lines with no
   effect, go too;
@@ -84,8 +85,12 @@ A file does not compile when its text needs something that no dependency records
   such as the `@[simp]` lemmas a tactic block in a definition relies on;
 - a library that does not use the module system, which a module cannot import.
 
-A private declaration's name holds the name of its module, so it is another constant in the file
-than in the project, and Comparator rejects a statement that reaches one: challenge-gen says so.
+The name of a private declaration holds the name of its module, and so does a hygienic name, as
+`irreducible_def` makes. Such a constant is another one in the file than in the project, and
+Comparator rejects a statement that reaches one. Likewise when two modules made an auxiliary
+theorem of the same statement apart: Lean reuses one within a module, so the file, which holds them
+in one, would take the first for both, and the later declaration's value would not be the
+project's. Such a file gets no configuration, and challenge-gen says why.
 
 ## Versions
 

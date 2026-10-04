@@ -21,7 +21,8 @@ Options:
   --module <Module>    import this module instead of every module under the root (repeatable)
 
 Each file is named after its declaration: `Foo.bar` is written to `Foo___bar.lean`, and beside it
-`Foo___bar.json`, Comparator's configuration, which lists the theorems to check.
+`Foo___bar.json`, Comparator's configuration, which lists the theorems to check. A file Comparator
+cannot check gets none, and challenge-gen says why.
 "
 
 structure Config where

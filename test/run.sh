@@ -26,11 +26,13 @@ sed -i "s/^rev = .*/rev = \"v$toolchain\"/" "$work/fixture/lakefile.toml"
 (cd "$work/fixture" && lake build -q >/dev/null)
 
 (cd "$work/fixture" && lake env "$bin" --root Fixture --out "$work/out") 2> "$work/gen.log"
-grep -q "file of Fixture.revealed: it reaches Fixture.secret, which is private" "$work/gen.log" ||
+grep -q "file of Fixture.oneAgain: in it, Lean takes Fixture.one._proof_1 for Fixture.oneAgain._proof_1" "$work/gen.log" ||
+  { echo "FAIL: a file where Lean reuses an auxiliary theorem the project made apart is not reported" >&2
+    cat "$work/gen.log" >&2; exit 1; }
+grep -q "file of Fixture.revealed: it reaches Fixture.secret, whose name holds its module's" "$work/gen.log" ||
   { echo "FAIL: a file Comparator cannot check, reaching a private declaration, is not reported" >&2
     cat "$work/gen.log" >&2; exit 1; }
 count=$(find "$work/out" -name '*.lean' | wc -l)
-[ "$(find "$work/out" -name '*.json' | wc -l)" -eq "$count" ] || { echo "FAIL: a file has no configuration" >&2; exit 1; }
 [ "$count" -gt 0 ] || { echo "FAIL: no file written" >&2; exit 1; }
 
 failed=0
@@ -44,9 +46,12 @@ done
 [ "$failed" -eq 0 ] || { echo "FAIL: $failed of $count files do not compile" >&2; exit 1; }
 echo "ok: the $count files compile"
 
-python3 - "$work/out" <<'EOF'
-import json, pathlib, sys
+python3 - "$work/out" "$work/gen.log" <<'EOF'
+import json, pathlib, re, sys
 out = pathlib.Path(sys.argv[1])
+# The files challenge-gen reports Comparator cannot check, which get no configuration.
+log = pathlib.Path(sys.argv[2]).read_text()
+unchecked = set(re.findall(r"cannot check the file of (\S+):", log))
 def read(name):
     return (out / (name.replace(".", "___") + ".lean")).read_text()
 def config(name):
@@ -64,6 +69,11 @@ for f in out.glob("*.lean"):
           f"{f.name}: an option that changes only what Lean reports is set")
     check("@[claim" not in text and "@[domain" not in text, f"{f.name} keeps an annotation")
     check(text.startswith("module\n"), f"{f.name} is not a module")
+    name = f.stem.replace("___", ".")
+    if f.name.startswith("_private") or name in unchecked:
+        check(not f.with_suffix(".json").exists(), f"{f.name}: Comparator cannot check it, yet it has a configuration")
+        continue
+    check(f.with_suffix(".json").exists(), f"{f.name} has no configuration")
     cfg = json.loads(f.with_suffix(".json").read_text())
     check(sorted(cfg) == ["challenge_module", "permitted_axioms", "solution_module", "theorem_names"]
           and cfg["permitted_axioms"] == ["propext", "Quot.sound", "Classical.choice"],
@@ -86,6 +96,8 @@ check("instance instIsSmallOfNatNat : IsSmall 3" in read("Fixture.smallVal_three
 check("⟨1, by decide⟩" in read("Fixture.one"), "one: a proof inside a definition is replaced")
 check(config("Fixture.one")["theorem_names"] == ["Fixture.one._proof_1"],
       "one: the theorem Lean makes of the proof inside it is not to be checked")
+check("@[ext] theorem Duo.ext'" in read("Fixture.duoSelf"),
+      "duoSelf: the ext lemma the proof inside it needs is not registered")
 also_one = read("Fixture.alsoOne")
 check("def one : Positive" in also_one
       and config("Fixture.alsoOne")["theorem_names"] == ["Fixture.one._proof_1"],
@@ -168,6 +180,9 @@ if ! python3 "$here/fidelity.py" "$work/fixture" "$work/slice" Fixture "$work/fi
   grep -A3 '^DIFFERS\|^UNLISTED\|^fail' "$work/fidelity-slice/fidelity.txt" | head -20 >&2
   exit 1
 fi
+python3 -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["theorem_names"] != ["Fixture.Slice.posBase_val"])' \
+  "$work/slice/Fixture___Slice___posBase_val.json" ||
+  { echo "FAIL: a theorem the file imports is to be checked" >&2; exit 1; }
 echo "ok: a slice's files compile and state what the fixture states ($(cat "$work/fidelity-slice.log"))"
 
 (cd "$work/fixture" && lake env "$bin" --root Fixture --decl Fixture.Uses.quad --out "$work/one" >/dev/null)

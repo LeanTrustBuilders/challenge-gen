@@ -130,7 +130,7 @@ structure CommandEntry where
 `TrustAnnotations` is the only one. It provides the annotation attributes (`annotationAttributes`)
 and nothing a formalization refers to: each records something for a reading tool to pick back out
 of the environment, and an extraction of one declaration has nothing to say with them. So the
-annotations are stripped (`isDroppedAttribute`) along with any option they are tuned by
+annotations are stripped (`attributeInFile?`) along with any option they are tuned by
 (`excludedOptions`), and then the import has nothing left to serve. A file that does not import it
 compiles wherever the project's other dependencies are available, Mathlib's web editor included.
 
@@ -362,28 +362,29 @@ reading tool and changes nothing a later declaration elaborates against. -/
 def annotationAttributes : List String :=
   ["claim", "specifies", "characterization", "example_of", "nonexample_of", "domain", "up_to"]
 
-/-- True if this attribute must be dropped from an extracted declaration, given `attrSrc`, the
-source text of a single attribute inside an `@[…]` group.
+/-- How an attribute is written in an extracted declaration, given `attrSrc`, the source text of a
+single attribute inside an `@[…]` group; `none` when it is dropped. `onStructure` says whether the
+declaration is a `structure` or a `class`, `eqConclusion` whether it is a theorem concluding with an
+equality.
 
-Two cases:
+* The `annotationAttributes` are dropped: their only effect is to record something for a reading
+  tool to pick back out, which says nothing in a one-declaration file — a characterization's parts
+  are separate declarations, so an extraction of any one of them has at most a part of the claim.
+  Dropping them is what lets `excludedImports` leave the `TrustAnnotations` import out of the
+  header — the two go together, since an unimported attribute is a hard error.
+* `@[ext]` on a theorem whose conclusion is not an equality becomes `@[ext (iff := false)]`. The
+  attribute registers the lemma for the `ext` tactic, which the proofs inside definitions run in the
+  file, and generates the converse `_iff` lemma **and proves it**, which needs the `@[refl]` lemma
+  of the relation in the statement (for `f ≡ᵐ[μ] g`, that is `Indistinguishable.refl`). That
+  dependency runs through an attribute rather than through any term, so it is invisible to the
+  dependency analysis and the lemma is not in the closure. For an equality the proof needs
+  `Eq.refl` only, and the attribute stays as written, making the lemma the project has.
 
-* `@[ext]` on a *theorem*: it generates the converse of the ext lemma **and proves it**, which needs
-  the `@[refl]` lemma of the relation in the statement (for `f ≡ᵐ[μ] g`, that is
-  `Indistinguishable.refl`). Since that dependency runs through an attribute rather than through any
-  term, it is invisible to the dependency analysis and the lemma is not in the closure. Registering
-  the lemma for the `ext` tactic would serve only the proofs inside definitions, the only proofs the
-  file runs.
-* The `annotationAttributes`: their only effect is to record something for a reading tool to pick
-  back out, which says nothing in a one-declaration file — a characterization's parts are separate
-  declarations, so an extraction of any one of them has at most a part of the claim. Dropping them
-  is what lets `excludedImports` leave the `TrustAnnotations` import out of the header — the two go
-  together, since an unimported attribute is a hard error.
-
-Three near neighbours are deliberately **kept**, each because it *produces* something the rest of
-the file may depend on rather than merely registering one:
+Three near neighbours are deliberately **kept** as written, each because it *produces* something the
+rest of the file may depend on rather than merely registering one:
 
 * `@[ext]` on a `structure`/`class` (hence the `onStructure` guard) is what defines `Foo.ext` and
-  `Foo.ext_iff` in the first place; only the theorem form is inert.
+  `Foo.ext_iff` in the first place.
 * plain `@[to_additive]` generates the additive sibling — the very thing the command siblings in
   `writeChallenges` work to keep elaborable.
 * `@[to_additive existing]` looks inert (it links to a counterpart declared elsewhere rather than
@@ -394,16 +395,20 @@ the file may depend on rather than merely registering one:
 
 Matching is on the attribute's own leading token, so the `local`/`scoped` kind prefix — part of the
 source text of the attribute, not of the `@[…]` group — is skipped first. -/
-def isDroppedAttribute (onStructure : Bool) (attrSrc : String) : Bool :=
+def attributeInFile? (onStructure eqConclusion : Bool) (attrSrc : String) : Option String :=
   let toks := (attrSrc.split fun c => c == ' ' || c == '\n' || c == '\t' || c == '\r').toArray
     |>.filterMap fun w =>
       let w := w.trimAscii.toString
       if w.isEmpty then none else some w
   let toks := if toks[0]? == some "local" || toks[0]? == some "scoped" then toks.drop 1 else toks
   match toks[0]? with
-  | some "ext" => !onStructure
-  | some t => annotationAttributes.contains t
-  | none => false
+  | some "ext" =>
+    if onStructure || eqConclusion || toks.any (·.startsWith "(iff") then some attrSrc
+    else match attrSrc.splitOn "ext" with
+      | before :: after => some (before ++ "ext (iff := false)" ++ "ext".intercalate after)
+      | [] => some attrSrc
+  | some t => if annotationAttributes.contains t then none else some attrSrc
+  | none => some attrSrc
 
 /-- The position after the whitespace that starts at `p` in `source`. -/
 def skipWhitespace (source : String) (p : String.Pos.Raw) : String.Pos.Raw := Id.run do
@@ -412,10 +417,10 @@ def skipWhitespace (source : String) (p : String.Pos.Raw) : String.Pos.Raw := Id
     p := p.next source
   return p
 
-/-- Source edits dropping every `isDroppedAttribute` from the `@[…]` groups in `root`. A group is
-re-rendered from the attributes that survive, or removed outright, with the whitespace after it,
-when none do. -/
-partial def attributeStripEdits (source : String) (root : Syntax) (onStructure : Bool) :
+/-- Source edits writing the `@[…]` groups in `root` as `attributeInFile?` writes their attributes. A
+group is re-rendered from the attributes that survive, or removed outright, with the whitespace
+after it, when none do. -/
+partial def attributeEdits (source : String) (root : Syntax) (onStructure eqConclusion : Bool) :
     Array (String.Pos.Raw × String.Pos.Raw × String) := Id.run do
   let mut acc : Array (String.Pos.Raw × String.Pos.Raw × String) := #[]
   let mut worklist : Array Syntax := #[root]
@@ -431,8 +436,8 @@ partial def attributeStripEdits (source : String) (root : Syntax) (onStructure :
           match i.getPos?, i.getTailPos? with
           | some is, some ie => some (slice source is ie)
           | _, _ => none
-        let kept := texts.filter (!isDroppedAttribute onStructure ·)
-        if kept.size != texts.size then
+        let kept := texts.filterMap (attributeInFile? onStructure eqConclusion ·)
+        if kept != texts then
           if kept.isEmpty then
             acc := acc.push (s, skipWhitespace source e, "")
           else
@@ -569,10 +574,13 @@ def processFile (env : Environment) (source : String) (commands : Array Syntax)
       -- included, and a definition takes the variables its value uses.
       let isProof := isTheoremDecl stx
       -- Attributes whose elaboration reaches outside this file are dropped from every declaration
-      -- command, theorem or not (see `isDroppedAttribute`), as is any `set_option … in` prefix
-      -- naming an option the extracted file's imports no longer register (see `excludedOptions`).
+      -- command, theorem or not, or changed (see `attributeInFile?`), as is any `set_option … in`
+      -- prefix naming an option the extracted file's imports no longer register (see
+      -- `excludedOptions`).
+      let eqConclusion := names.any fun n => (env.find? n).any fun ci =>
+        ci matches .thmInfo _ && ci.type.getForallBody.getAppFn.isConstOf ``Eq
       let prefixEdits :=
-        attributeStripEdits source stx (isStructureDecl stx) ++ setOptionStripEdits stx
+        attributeEdits source stx (isStructureDecl stx) eqConclusion ++ setOptionStripEdits stx
           ++ (instanceNameEdit? env nsPrefixStack.back! stx names).toArray
       -- Renders the command from `start`, which is either the command's own start or — for a
       -- declaration wrapped in `omit … in` — the start of the wrapped declaration, so that
@@ -1118,6 +1126,8 @@ structure Assembled where
   text : String
   /-- The project's declarations it declares, in the order it declares them. -/
   decls : Array Name
+  /-- The project's modules whose text it copies. -/
+  modules : Array Name
 
 /-- Assembles the standalone file for `target`. `cache` holds the processed entries per module;
 `moduleOrder` lists the project modules in dependency-first order; `keep` is the target's transitive
@@ -1353,7 +1363,8 @@ def assembleTarget (env : Environment) (rootPrefix : Name) (cache : Std.HashMap 
     for ns in nsStubs do
       out := out ++ s!"namespace {ns}\nend {ns}\n"
   out := out ++ body
-  return { text := (collapseBlankRuns out).trimAscii.toString ++ "\n", decls }
+  return { text := (collapseBlankRuns out).trimAscii.toString ++ "\n", decls,
+           modules := involved.map (·.1) }
 
 /-! ## Driver -/
 
@@ -1458,25 +1469,27 @@ opaque importWithExtensions (imports : Array Import) : IO Environment
 reaches from `target`, as it walks the file (see "Comparator" above). The walk follows a statement,
 the constructors of an inductive type, and the value of a definition, which a proof inside it makes
 reach theorems Lean made of that proof (`foo._proof_1`); it stops at a theorem, whose proof
-Comparator does not compare, and at the constants of an imported library, the same on both sides.
+Comparator does not compare, and at the constants the file imports rather than copies (those of
+`modules` are the ones it copies), the same on both sides.
 `target` comes first, then the others in the order the file declares them, then the theorems Lean
 made.
 
-Also returns the private declarations the walk reaches, where it stops: a private name holds the
-name of its module, which the file does not have, so Comparator cannot match one. -/
-def theoremsToCheck (env : Environment) (rootPrefix : Name) (decls : Array Name) (target : Name) :
+Also returns the constants the walk reaches whose names hold the name of their module, which the
+file does not have, so that Comparator cannot match them: private declarations, and hygienic names,
+as `irreducible_def` makes. The walk stops there. -/
+def theoremsToCheck (env : Environment) (modules decls : Array Name) (target : Name) :
     Array Name × Array Name := Id.run do
   let mut found : Array Name := #[]
-  let mut privates : Array Name := #[]
+  let mut unmatchable : Array Name := #[]
   let mut seen : Std.HashSet Name := {}
   let mut todo : Array Name := #[target]
   while !todo.isEmpty do
     let n := todo.back!
     todo := todo.pop
-    if seen.contains n || !isProjectLocalConst env rootPrefix n then continue
+    if seen.contains n || !(moduleNameOf env n).any modules.contains then continue
     seen := seen.insert n
-    if isPrivateName n then
-      privates := privates.push n
+    if isPrivateName n || n.hasMacroScopes then
+      unmatchable := unmatchable.push n
       continue
     let some info := env.find? n | continue
     let mut deps := info.type.getUsedConstants
@@ -1488,7 +1501,32 @@ def theoremsToCheck (env : Environment) (rootPrefix : Name) (decls : Array Name)
     todo := todo ++ deps.reverse
   let declared := decls.filter fun n => n != target && found.contains n
   return (found.filter (· == target) ++ declared
-    ++ found.filter (fun n => n != target && !declared.contains n), privates)
+    ++ found.filter (fun n => n != target && !declared.contains n), unmatchable)
+
+/-- The auxiliary theorems the project made apart that the file, declaring `decls` in this order and
+copying the text of `modules`, would not: pairs of such a theorem and the one made earlier in the
+file that Lean takes instead.
+Lean reuses an auxiliary theorem made earlier in the same module for a proof of the same statement
+(`auxiliaryOwners`), so a file, holding declarations of several modules in one, may reuse one where
+the project did not: there, the value of the declaration is not the project's. Read off the project:
+the theorems of `modules` a declaration refers to that are not among `decls`, in its statement
+and, for one that is not a theorem, its value, compared on their statements and universe
+parameters. -/
+def reusedAuxiliaries (env : Environment) (modules decls : Array Name) :
+    Array (Name × Name) := Id.run do
+  let mut made : Std.HashMap (Expr × List Name) Name := {}
+  let mut reused : Array (Name × Name) := #[]
+  for d in decls do
+    let some info := env.find? d | continue
+    let value := if info matches .thmInfo _ then #[] else
+      ((info.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[]
+    for c in info.type.getUsedConstants ++ value do
+      if decls.contains c || !(moduleNameOf env c).any modules.contains then continue
+      let some (.thmInfo t) := env.find? c | continue
+      match made.get? (t.type, t.levelParams) with
+      | some earlier => if earlier != c && !reused.any (·.1 == c) then reused := reused.push (c, earlier)
+      | none => made := made.insert (t.type, t.levelParams) c
+  return reused
 
 /-- Comparator's configuration for a file whose theorems to check are `theorems`, under Palomar's
 conventions: the file as the module `Challenge`, the solution as `Solution`, and only the axioms
@@ -1506,8 +1544,9 @@ def comparatorConfig (theorems : Array Name) : String :=
 /-- Writes a standalone `<anchorIdOf target>.lean` file into `dir` for each of `targets`, the
 declarations of the project `ctx` was made for (`MeaningGraph.Context.of env rootPrefix`), whose
 source files are under `projectDir`, and beside it `<anchorIdOf target>.json`, Comparator's
-configuration for it (`comparatorConfig`). Targets that are not declarations of the project are
-skipped. Returns the number of files written.
+configuration for it (`comparatorConfig`), unless Comparator cannot check the file, which is then
+said on the standard error. Targets that are not declarations of the project are skipped. Returns
+the number of files written.
 
 `builtinOptions` are Lean's own options, those registered before any module was imported
 (`getOptionDecls` at the start of the process): the options the project is built with are set
@@ -1646,14 +1685,25 @@ def writeChallenges (ctx : MeaningGraph.Context) (projectDir dir : System.FilePa
     let file := assembleTarget env rootPrefix cache moduleOrder exposedNames keep projectNamespaces
       moduleOptions projectShortNames target
     IO.FS.writeFile (dir / s!"{anchorIdOf target}.lean") file.text
-    let (theorems, privates) := theoremsToCheck env rootPrefix file.decls target
-    if privates.contains target then
-      IO.eprintln s!"challenge-gen: Comparator cannot check {privateToUserName target}, which is private"
-    else if let some p := privates[0]? then
-      IO.eprintln s!"challenge-gen: Comparator cannot check the file of {target}: it reaches \
-        {privateToUserName p}, which is private{if privates.size > 1 then
-          s!" (and {privates.size - 1} more)" else ""}"
-    IO.FS.writeFile (dir / s!"{anchorIdOf target}.json") (comparatorConfig theorems)
+    let (theorems, unmatchable) := theoremsToCheck env file.modules file.decls target
+    let reused := reusedAuxiliaries env file.modules file.decls
+    -- Why Comparator cannot check the file, if it cannot: then it gets no configuration.
+    let shown (n : Name) : Name := (privateToUserName n).eraseMacroScopes
+    let unchecked? : Option String :=
+      if unmatchable.contains target then some s!"{shown target}, which is private"
+      else if let some n := unmatchable[0]? then
+        some s!"the file of {target}: it reaches {shown n}, whose name holds its module's\
+          {if unmatchable.size > 1 then s!" (and {unmatchable.size - 1} more)" else ""}"
+      else if let some (c, earlier) := reused[0]? then
+        some s!"the file of {target}: in it, Lean takes {earlier} for {c}, which the project \
+          made apart"
+      else none
+    let config := dir / s!"{anchorIdOf target}.json"
+    match unchecked? with
+    | some why =>
+      IO.eprintln s!"challenge-gen: Comparator cannot check {why}"
+      if ← config.pathExists then IO.FS.removeFile config
+    | none => IO.FS.writeFile config (comparatorConfig theorems)
   return targets.size
 
 end ChallengeGen
