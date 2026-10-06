@@ -8,7 +8,7 @@ defaultTargets = ["ChallengeGen", "challenge-gen"]
 name = "MeaningGraph"
 git = "https://github.com/LeanTrustBuilders/meaning-graph"
 # `main` follows the newest toolchain, `lean-v<toolchain>` older ones.
-rev = "main"
+rev = "lean-v4.35.0-rc3"
 
 # No glob: the default builds the root module and whatever it imports, and the root imports every
 # submodule. A `ChallengeGen.*` glob would sweep `ChallengeGen.Test` into the library.
