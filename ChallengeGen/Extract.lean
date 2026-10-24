@@ -305,9 +305,10 @@ partial def collectIdents (stx : Syntax) : Array String := Id.run do
   return acc
 
 /-- Decomposes a `variable` command into its individual binders, each as `(source text, identifiers
-referenced)`. The binders are the children of the `many1` node following the `variable` keyword. -/
+referenced)`. The binders are the children of the command's last node, the `many1` following the
+keyword (a `variable` may have a visibility before it). -/
 def decomposeVariable (source : String) (stx : Syntax) : Array (String × Array String) := Id.run do
-  let binderNodes := if stx.getArgs.size ≥ 2 then stx[1].getArgs else #[]
+  let binderNodes := if stx.getArgs.size ≥ 2 then stx[stx.getArgs.size - 1].getArgs else #[]
   let mut res : Array (String × Array String) := #[]
   for b in binderNodes do
     match b.getPos?, b.getTailPos? with
