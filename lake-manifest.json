@@ -5,7 +5,7 @@
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "34a9eee71b8d9b4bd3d8d22a0aa26859e4b2ec0e",
+   "rev": "5ea9b6112790f60c1474cbca55022e5c2ea53cfb",
    "name": "MeaningGraph",
    "manifestFile": "lake-manifest.json",
    "inputRev": "main",
