@@ -8,7 +8,7 @@
    "rev": "34a9eee71b8d9b4bd3d8d22a0aa26859e4b2ec0e",
    "name": "MeaningGraph",
    "manifestFile": "lake-manifest.json",
-   "inputRev": "main",
+   "inputRev": "lean-v4.36.0",
    "inherited": false,
    "configFile": "lakefile.toml"}],
  "name": "ChallengeGen",
